@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index c8d92b9..0b67a51 100644
+index c8d92b9..a5f45a3 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -23,6 +23,14 @@
@@ -55,7 +55,7 @@ index c8d92b9..0b67a51 100644
  		printf("SWEET EMMC: identification failed\n");
  		return EIO;
  	}
-@@ -426,12 +440,83 @@ emmc_init_card(void)
+@@ -426,12 +440,96 @@ emmc_init_card(void)
  		ufs_wr(EM_HOSTCTL, ufs_rd(EM_HOSTCTL) | (1u << 2));
  		emmc_set_clock(su.emmc_div);
  	}
@@ -95,7 +95,8 @@ index c8d92b9..0b67a51 100644
 +	}
 +	ufs_wr(EM_HOSTCTL, ufs_rd(EM_HOSTCTL) & ~((1u << 5) | (1u << 2) | (1u << 1) | (3u << 3)));
 +	ufs_wr(EM_CLOCK, (ufs_rd(EM_CLOCK) & ~(0xffu << 16)) | (0x0eu << 16));
-+	emmc_set_clock((base ? base : 200) * 1000 / 800);       /* <= 400 kHz */
++	(void)base;
++	emmc_set_clock(125);            /* 400 kHz from ABL's 100 MHz SDCC2 clock (caps says 200) */
 +
 +	su.rca = 0;
 +	(void)emmc_cmd(0, 0, 0, NULL);
@@ -104,16 +105,28 @@ index c8d92b9..0b67a51 100644
 +		printf("SWEET SD: no SD 2.0 card (CMD8 resp 0x%x): supplies off or no card?\n", resp);
 +		return ENXIO;
 +	}
-+	for (int i = 0; i < 1000 && !(ocr & (1u << 31)); i++) {
-+		if (sd_acmd(41, 0x40ff8000, EM_R48, &ocr)) {     /* HCS, 2.7-3.6 V */
++	/* Up to ~2 s: CMD55 / ACMD41 failures are counted for the log. */
++	uint32_t e55 = 0, e41 = 0, last = 0, st = 0;
++	for (int i = 0; i < 2000 && !(ocr & (1u << 31)); i++) {
++		int error = emmc_cmd(55, 0, EM_R48 | EM_CRC | EM_IDX, NULL);
++		if (error) {
++			e55++;
++			st = ufs_rd(EM_INT_STAT);
++		} else if ((error = emmc_cmd(41, 0x40ff8000, EM_R48, &ocr))) {   /* HCS, 2.7-3.6 V */
++			e41++;
++			st = ufs_rd(EM_INT_STAT);
 +			ocr = 0;
++		} else {
++			last = ocr;
 +		}
 +		if (!(ocr & (1u << 31))) {
 +			delay(1000);
 +		}
 +	}
 +	if (!(ocr & (1u << 31)) || !(ocr & (1u << 30))) {
-+		printf("SWEET SD: card not ready or not SDHC/SDXC (ocr 0x%x)\n", ocr);
++		printf("SWEET SD: card not ready or not SDHC/SDXC (ocr 0x%x, last answer 0x%x, "
++		    "CMD55 errors %u, ACMD41 errors %u, int 0x%x, clock 0x%x, present 0x%x)\n",
++		    ocr, last, e55, e41, st, ufs_rd(EM_CLOCK), ufs_rd(EM_PRESENT));
 +		return ENXIO;
 +	}
 +	if (emmc_cmd(2, 0, EM_R136 | EM_CRC, NULL) ||
@@ -140,7 +153,7 @@ index c8d92b9..0b67a51 100644
  /*
   * One SCSI command in slot 0, data (if any) to/from the bounce buffer
   * (to the device when write is set). Returns 0 or an errno.
-@@ -1049,6 +1134,9 @@ sweet_ufs_init(void)
+@@ -1049,6 +1147,9 @@ sweet_ufs_init(void)
  		su.emmc = false;
  	} else if (SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) == kSuccess) {
  		su.emmc = true;                 /* ginkgo */
@@ -150,7 +163,7 @@ index c8d92b9..0b67a51 100644
  	} else {
  		printf("SWEET UFS: no /sweet-ufs or /sweet-sdhci node in the device tree\n");
  		return ENXIO;
-@@ -1061,6 +1149,11 @@ sweet_ufs_init(void)
+@@ -1061,6 +1162,11 @@ sweet_ufs_init(void)
  	su.blksz = su.emmc ? 512u : 4096u;
  	su.emmc_div = 4;                        /* <= 50 MHz even from a 400 MHz source */
  	PE_parse_boot_argn("emmcdiv", &su.emmc_div, sizeof(su.emmc_div));
@@ -162,12 +175,19 @@ index c8d92b9..0b67a51 100644
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
  	uint32_t rw = 0;
  	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
-@@ -1087,7 +1180,7 @@ sweet_ufs_init(void)
+@@ -1087,7 +1193,14 @@ sweet_ufs_init(void)
  	su.secsize = DEV_BSIZE;
  
  	lck_mtx_lock(&sweet_ufs_lock);
 -	error = su.emmc ? emmc_init_card() : ufs_take_over_host();
 +	error = su.sd ? sd_init_card() : su.emmc ? emmc_init_card() : ufs_take_over_host();
++	if (error && su.sd) {
++		/* Once more after a bus power cycle (host power off, 50 ms). */
++		ufs_wr(EM_HOSTCTL, ufs_rd(EM_HOSTCTL) & ~0xff00u);
++		emmc_pwrctl_ack();
++		delay(50000);
++		error = sd_init_card();
++	}
  	if (!error && !su.emmc) {
  		static const uint8_t tur[6] = { 0x00 };
  		/* The first command after the bootloader may report a unit attention. */
