@@ -699,6 +699,27 @@ static int rpm_ldo_on(int lcid, uint32_t id, uint32_t uv, uint32_t msg_id)
 	return -1;
 }
 
+/*
+ * The microSD's supplies through the RPM: VDD-IO (ldoa 5) and VDD (ldoa 22)
+ * at 2.952 V. ABL leaves both off and no GLINK session behind, so open
+ * rpm_requests first unless an earlier call did. RPM votes outlive the shim:
+ * xnu's SD backend (/sweet-sdhci sd-card) relies on them. 0 when both answered.
+ */
+int sd_power_on(void)
+{
+	int lcid = rpm_find();
+	if (lcid < 0 && rpm_tx.size && mr_rd(rpm_tx.off + 4) == 0 && mr_rd(rpm_rx.off + 4) == 0)
+		lcid = rpm_open();
+	if (lcid < 0) {
+		con_str("RPM", "no rpm_requests channel: SD supplies stay off");
+		return -1;
+	}
+	int r = rpm_ldo_on(lcid, 5, 2952000, 0x5d05);		/* vdd-io, 3.3 V signalling */
+	r |= rpm_ldo_on(lcid, 22, 2952000, 0x5d22);		/* vdd */
+	delay_us(10000);
+	return r;
+}
+
 void test_sdcard(void)
 {
 	con_clear(BLUE);
@@ -732,17 +753,7 @@ void test_sdcard(void)
 	/* present: bit 16 card inserted, 17 state stable, 18 card-detect pin */
 	con_hex2("CARD", "inserted=", (present >> 16) & 1, "cd pin=", (present >> 18) & 1);
 
-	/* v2: the card's supplies through the RPM, if ABL left its channel open. */
-	int lcid = rpm_find();
-	if (lcid < 0 && mr_rd(rpm_tx.off + 4) == 0 && mr_rd(rpm_rx.off + 4) == 0)
-		lcid = rpm_open();
-	if (lcid >= 0) {
-		(void)rpm_ldo_on(lcid, 5, 2952000, 0x5d05);	/* vdd-io, 3.3 V signalling */
-		(void)rpm_ldo_on(lcid, 22, 2952000, 0x5d22);	/* vdd */
-		delay_us(10000);
-	} else {
-		con_str("RPM", "no open rpm_requests channel: not asking");
-	}
+	(void)sd_power_on();
 
 	/* Full host reset, acknowledged to the msm core (it asks for bus off). */
 	hc_wr(R_CLOCK, hc_rd(R_CLOCK) | (1u << 24));

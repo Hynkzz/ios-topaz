@@ -297,6 +297,10 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
 		con_skip();
+#ifdef GINKGO
+		/* Harmless without a card; needed by an SD root (mkadt --sd). */
+		(void)sd_power_on();
+#endif
 		con_str("LOADER", loader_boot(dtb));
 #ifdef GINKGO
 		/* No xnu payload: probe the eMMC (or, with -DSDPROBE, the microSD) read-only. */

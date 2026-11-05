@@ -33,6 +33,8 @@ GINKGO_PHYS_BASE, GINKGO_MEM_SIZE = 0x82000000, 0xbe000000
 GINKGO_FB_H = 2340
 # eMMC host sdhci@4744000 ("hc_mem"); bsd/dev/sweet_ufs.c re-initializes it.
 GINKGO_SDHCI, GINKGO_SDHCI_SIZE = 0x04744000, 0x1000
+# --sd: root on the microSD instead (sdhc_2; the shim powers the card via the RPM)
+GINKGO_SDCARD = 0x04784000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -86,7 +88,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, ginkgo=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, ginkgo=False, sd=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
@@ -224,8 +226,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gink
     sdhci = node('sweet-sdhci', [
         ph(),
         ('compatible', cstr('qcom,sdhci-msm-v5')),
-        ('reg', u64(GINKGO_SDHCI, GINKGO_SDHCI_SIZE)),
-    ])
+        ('reg', u64(GINKGO_SDCARD if sd else GINKGO_SDHCI, GINKGO_SDHCI_SIZE)),
+    ] + ([('sd-card', u32(1))] if sd else []))
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -264,7 +266,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gink
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
                  native='--native' in sys.argv, midmem='--midmem' in sys.argv,
-                 ginkgo='--ginkgo' in sys.argv)
+                 ginkgo='--ginkgo' in sys.argv, sd='--sd' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
