@@ -11,7 +11,7 @@ DTB=${DTB:-../dtb/boot_unpacked/dtb}
 [ -f "$DTB" ] || { echo "error: stock DTB not found at $DTB (run tools/unpack_bootv2.py first)" >&2; exit 1; }
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-DGINKGO -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+CFLAGS="-DGINKGO ${EXTRA_CFLAGS:-} -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 mkdir -p out
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c sdhci.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o

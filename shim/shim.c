@@ -299,9 +299,13 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		con_skip();
 		con_str("LOADER", loader_boot(dtb));
 #ifdef GINKGO
-		/* No xnu payload: probe the eMMC instead (read-only). */
+		/* No xnu payload: probe the eMMC (or, with -DSDPROBE, the microSD) read-only. */
 		con_skip();
+#ifdef SDPROBE
+		test_sdcard();
+#else
 		test_sdhci();
+#endif
 #endif
 	}
 	for (;;)

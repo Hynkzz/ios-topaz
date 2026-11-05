@@ -72,8 +72,11 @@
 
 #define TIMEOUT_TICKS	(19200000u / 2)		/* 0.5 s at 19.2 MHz */
 
-static inline uint32_t hc_rd(uint32_t off) { return *(volatile uint32_t *)(HC_BASE + off); }
-static inline void hc_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(HC_BASE + off) = v; }
+/* The eMMC host by default; test_sdcard() points this at the microSD host. */
+static uintptr_t hc_base = HC_BASE;
+
+static inline uint32_t hc_rd(uint32_t off) { return *(volatile uint32_t *)(hc_base + off); }
+static inline void hc_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(hc_base + off) = v; }
 
 static uint32_t buf[32 * 512 / 4];	/* up to 32 sectors */
 
@@ -448,4 +451,377 @@ void test_sdhci(void)
 		}
 	}
 	con_str("GPT", "no partition named userdata");
+}
+
+/*
+ * microSD probe (sdhc_2, sdhci@4784000): can our code use the card slot?
+ *
+ * ABL boots from the eMMC and may leave sdhc_2 unclocked; an access to an
+ * unclocked host can hang the bus, so its GCC clock branches are read first
+ * and, if needed, enabled with the root clock on XO (19.2 MHz). The card is
+ * then identified the SD way (CMD0, CMD8, ACMD41, CMD2, CMD3 with the RCA the
+ * card publishes, CMD7) in a 1-bit bus and LBA 0 is read in PIO. Nothing is
+ * written to the card: there is no CMD24/CMD25 here. The card's supplies
+ * (vdd L22, vdd-io L5) belong to the RPM; this probe cannot switch them, it
+ * only reports whether the card answers.
+ * Sources: trinket.dtsi sdhc_2 / trinket-qrd.dtsi, Linux gcc-sm6125.c.
+ */
+#define SD_BASE			0x04784000UL
+#define GCC_BASE		0x01400000UL
+#define GCC_SDCC2_APPS_CBCR	0x1e004
+#define GCC_SDCC2_AHB_CBCR	0x1e008
+#define GCC_SDCC2_RCG_CMD	0x1e00c
+#define GCC_SDCC2_RCG_CFG	0x1e010
+#define CBCR_CLK_OFF		(1u << 31)
+#define RCG_ROOT_OFF		(1u << 31)
+#define RCG_UPDATE		(1u << 0)
+
+static inline uint32_t gcc_rd(uint32_t off) { return *(volatile uint32_t *)(GCC_BASE + off); }
+static inline void gcc_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(GCC_BASE + off) = v; }
+
+/* Enable a branch clock; 0 once its CLK_OFF bit clears. */
+static int gcc_branch_on(uint32_t off)
+{
+	gcc_wr(off, gcc_rd(off) | 1);
+	uint64_t end = ticks() + TIMEOUT_TICKS;
+	while (gcc_rd(off) & CBCR_CLK_OFF)
+		if (ticks() > end)
+			return -1;
+	return 0;
+}
+
+/*
+ * The card's supplies, pm6125 L5 (I/O) and L22 (card), are RPM resources
+ * ("ldoa" 5 and 22; ginkgo dtbo: L22 2.95 V, L5 1.8-2.95 V; allowed ranges
+ * 1.648-3.104 V and 2.944-3.304 V). Requests go over GLINK in the RPM's
+ * message RAM: a table of contents ("grt0") in its last 256 bytes names two
+ * FIFOs, "ap2r" (to the RPM) and "r2ap", each a tail word, a head word and
+ * the data; the RPM is rung through the APCS IPC register. ABL's UEFI may
+ * leave its "rpm_requests" channel open: rpm_find() only reads the FIFO
+ * history to find it, rpm_ldo_on() then queues one request behind it.
+ * Layout: Linux drivers/rpmsg/qcom_glink_rpm.c, qcom_glink_native.c,
+ * drivers/soc/qcom/smd-rpm.c; DT memory@045F0000, mailbox@0F111000.
+ */
+#define RPM_MSG_RAM		0x045f0000UL
+#define RPM_MSG_RAM_SIZE	0x7000u
+#define RPM_TOC_MAGIC		0x67727430	/* "grt0" */
+#define RPM_FIFO_AP2R		0x61703272	/* "ap2r" */
+#define RPM_FIFO_R2AP		0x72326170	/* "r2ap" */
+#define RPM_IPC_DOORBELL	0x0f111008UL
+#define GLINK_OPEN		2
+#define GLINK_CLOSE		3
+#define GLINK_OPEN_ACK		4
+#define GLINK_INTENT		5
+#define GLINK_TX_DATA		9
+
+struct rpm_fifo { uint32_t off, size; };
+static struct rpm_fifo rpm_tx, rpm_rx;
+
+static inline uint32_t mr_rd(uint32_t off) { return *(volatile uint32_t *)(RPM_MSG_RAM + off); }
+static inline void mr_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(RPM_MSG_RAM + off) = v; }
+
+/* Our local channel id of "rpm_requests" in what ABL left, or -1. */
+static int rpm_find(void)
+{
+	uint32_t toc = RPM_MSG_RAM_SIZE - 256, n = mr_rd(toc + 4);
+	rpm_tx.size = rpm_rx.size = 0;
+	if (mr_rd(toc) != RPM_TOC_MAGIC || n > 20) {
+		con_hex2("RPM", "toc magic=", mr_rd(toc), "n=", n);
+		return -1;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t id = mr_rd(toc + 8 + 12 * i), off = mr_rd(toc + 12 + 12 * i), size = mr_rd(toc + 16 + 12 * i);
+		struct rpm_fifo *f = id == RPM_FIFO_AP2R ? &rpm_tx : id == RPM_FIFO_R2AP ? &rpm_rx : 0;
+		if (f && off + size <= RPM_MSG_RAM_SIZE) {
+			f->off = off;
+			f->size = size;
+		}
+	}
+	if (!rpm_tx.size || !rpm_rx.size) {
+		con_str("RPM", "toc without ap2r/r2ap");
+		return -1;
+	}
+	uint32_t head = mr_rd(rpm_tx.off + 4);
+	con_hex2("RPM ap2r", "tail=", mr_rd(rpm_tx.off), "head=", head);
+	con_hex2("RPM r2ap", "tail=", mr_rd(rpm_rx.off), "head=", mr_rd(rpm_rx.off + 4));
+	/* Walk what was sent since boot: find OPEN "rpm_requests"; count data packets. */
+	int lcid = -1;
+	uint32_t at = 0, data = rpm_tx.off + 8, sent = 0, ldo = 0;
+	while (at + 8 <= head && head <= rpm_tx.size) {
+		uint32_t w0 = mr_rd(data + at), cmd = w0 & 0xffff, p1 = w0 >> 16, len = 8;
+		if (cmd == GLINK_OPEN) {
+			uint32_t nl = mr_rd(data + at + 4) & 0xffff;
+			const volatile char *nm = (const volatile char *)(RPM_MSG_RAM + data + at + 8);
+			if (nl >= 12 && nm[0] == 'r' && nm[4] == 'r' && nm[5] == 'e' && nm[6] == 'q')
+				lcid = (int)p1;
+			len = 8 + ((nl + 7) & ~7u);
+		} else if (cmd == GLINK_TX_DATA) {
+			uint32_t chunk = mr_rd(data + at + 8);
+			if (mr_rd(data + at + 16 + 16) == 0x616f646c)	/* "ldoa" */
+				ldo++;
+			sent++;
+			len = 16 + ((chunk + 7) & ~7u);
+		} else if (cmd == GLINK_CLOSE && (int)p1 == lcid) {
+			lcid = -1;					/* closed again by ABL */
+		} else if (cmd == GLINK_INTENT) {
+			len = 8 + 8 * mr_rd(data + at + 4);		/* count x (size, iid) */
+		} else if (cmd > 14) {
+			break;
+		}
+		at += len;
+	}
+	con_hex2("RPM", "rpm_requests lcid=", (uint32_t)lcid, "data pkts=", sent);
+	con_hex2("RPM", "of them ldoa=", ldo, "walked to=", at);
+	return lcid;
+}
+
+/* Queue count words (a multiple of 2) into ap2r and ring the RPM. */
+static int rpm_put(const uint32_t *w, uint32_t count)
+{
+	uint32_t tail = mr_rd(rpm_tx.off), head = mr_rd(rpm_tx.off + 4);
+	uint32_t room = tail <= head ? rpm_tx.size - head + tail : tail - head;
+	if (count * 4 + 8 > room || (head & 7) || head >= rpm_tx.size)
+		return -1;
+	for (uint32_t i = 0; i < count; i++) {
+		mr_wr(rpm_tx.off + 8 + head, w[i]);
+		head = (head + 4) % rpm_tx.size;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	mr_wr(rpm_tx.off + 4, head);
+	__asm__ volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t *)RPM_IPC_DOORBELL = 1;
+	return 0;
+}
+
+static uint32_t rx_word(uint32_t at) { return mr_rd(rpm_rx.off + 8 + at % rpm_rx.size); }
+
+/*
+ * Next packet from the RPM within timeout: its first two words (and for an
+ * OPEN whether it names rpm_requests); the packet is consumed. -1: none.
+ */
+static int rpm_get(uint32_t *w0, uint32_t *w1, int *is_req, uint64_t timeout)
+{
+	uint64_t end = ticks() + timeout;
+	uint32_t tail = mr_rd(rpm_rx.off);
+	while (mr_rd(rpm_rx.off + 4) == tail)
+		if (ticks() > end)
+			return -1;
+	*w0 = rx_word(tail);
+	*w1 = rx_word(tail + 4);
+	uint32_t cmd = *w0 & 0xffff, len = 8;
+	*is_req = 0;
+	if (cmd == GLINK_OPEN) {
+		*is_req = (rx_word(tail + 8) & 0xffffffff) == 0x5f6d7072;	/* "rpm_" */
+		len = 8 + (((*w1 & 0xffff) + 7) & ~7u);
+	} else if (cmd == GLINK_TX_DATA) {
+		len = 16 + ((rx_word(tail + 8) + 7) & ~7u);
+	} else if (cmd == GLINK_INTENT) {
+		len = 8 + 8 * *w1;
+	}
+	mr_wr(rpm_rx.off, (tail + len) % rpm_rx.size);
+	return 0;
+}
+
+/*
+ * Nobody talked to the RPM yet (both FIFOs at 0): what Linux's glink-rpm does
+ * at probe. VERSION 1 without features both ways, then OPEN "rpm_requests" as
+ * our channel 1 and OPEN_ACK of the RPM's own OPEN. Returns 1 (our lcid).
+ */
+static int rpm_open(void)
+{
+	static const uint32_t ver[2] = { 0 /* VERSION */ | 1u << 16, 0 };
+	static const uint32_t open[6] = { GLINK_OPEN | 1u << 16, 13,
+		0x5f6d7072, 0x75716572, 0x73747365, 0 };		/* "rpm_requests\0" */
+	uint32_t w0, w1, rcid = 0, got = 0;
+	int is_req;
+	mr_wr(rpm_rx.off, mr_rd(rpm_rx.off + 4));		/* start from what is there */
+	if (rpm_put(ver, 2))
+		return -1;
+	uint64_t end = ticks() + TIMEOUT_TICKS;			/* 0.5 s */
+	while (ticks() < end && got != 7) {
+		if (rpm_get(&w0, &w1, &is_req, TIMEOUT_TICKS / 10))
+			continue;
+		uint32_t cmd = w0 & 0xffff, p1 = w0 >> 16;
+		if (cmd == 0) {					/* the RPM's VERSION: ack it */
+			uint32_t ack[2] = { 1 | p1 << 16, 0 };
+			(void)rpm_put(ack, 2);
+			if (!(got & 1)) {			/* negotiated either way */
+				got |= 1;
+				(void)rpm_put(open, 6);
+			}
+		} else if (cmd == 1 && !(got & 1)) {		/* VERSION_ACK: now OPEN */
+			got |= 1;
+			(void)rpm_put(open, 6);
+		} else if (cmd == GLINK_OPEN_ACK && p1 == 1) {
+			got |= 2;
+		} else if (cmd == GLINK_OPEN && is_req) {
+			uint32_t ack[2] = { GLINK_OPEN_ACK | p1 << 16, 0 };
+			rcid = p1;
+			got |= 4;
+			(void)rpm_put(ack, 2);
+		}
+	}
+	con_hex2("RPM glink", "got(ver|ack|open)=", got, "rcid=", rcid);
+	return got == 7 ? 1 : -1;
+}
+
+/* Ask for ldoa id on at uv; prints the RPM's first answer words. 0 on an answer. */
+static int rpm_ldo_on(int lcid, uint32_t id, uint32_t uv, uint32_t msg_id)
+{
+	uint32_t m[20] = {
+		GLINK_TX_DATA | (uint32_t)lcid << 16, 0, 28 + 36, 0,
+		0x00716572 /* "req" */, 20 + 36, msg_id, 0 /* active set */,
+		0x616f646c /* "ldoa" */, id, 36,
+		0x00007675 /* "uv" */, 4, uv,
+		0x646d736c /* "lsmd" */, 4, 7 /* high power */,
+		0x6e657773 /* "swen" */, 4, 1,
+	};
+	uint32_t w0, w1;
+	int is_req;
+	if (rpm_put(m, 20)) {
+		con_hex2("RPM ldoa", "no room id=", id, "", 0);
+		return -1;
+	}
+	/* The answer: TX_DATA on the RPM's channel, service "msg" (or "err"). */
+	uint32_t tail = mr_rd(rpm_rx.off);
+	for (int i = 0; i < 4; i++) {
+		if (rpm_get(&w0, &w1, &is_req, TIMEOUT_TICKS / 5)) {
+			con_hex2("RPM ldoa", "no answer id=", id, "uv=", uv);
+			return -1;
+		}
+		if ((w0 & 0xffff) == GLINK_TX_DATA) {
+			con_hex2("RPM ldoa", "id=", id, "svc=", rx_word(tail + 16));
+			con_hex2("RPM ldoa", "w2=", rx_word(tail + 24), "w3=", rx_word(tail + 28));
+			return 0;
+		}
+		tail = mr_rd(rpm_rx.off);
+	}
+	return -1;
+}
+
+void test_sdcard(void)
+{
+	con_clear(BLUE);
+	con_str("SD", "ginkgo microSD probe v3 (no data writes)");
+	con_hex2("GCC", "ahb=", gcc_rd(GCC_SDCC2_AHB_CBCR), "apps=", gcc_rd(GCC_SDCC2_APPS_CBCR));
+	con_hex2("GCC", "rcg cmd=", gcc_rd(GCC_SDCC2_RCG_CMD), "cfg=", gcc_rd(GCC_SDCC2_RCG_CFG));
+
+	/* Root clock on XO, no divider, no M/N: the host divides it below. */
+	gcc_wr(GCC_SDCC2_RCG_CFG, gcc_rd(GCC_SDCC2_RCG_CFG) & ~((3u << 12) | (7u << 8) | 0x1fu));
+	gcc_wr(GCC_SDCC2_RCG_CMD, gcc_rd(GCC_SDCC2_RCG_CMD) | RCG_UPDATE);
+	uint64_t end = ticks() + TIMEOUT_TICKS;
+	while (gcc_rd(GCC_SDCC2_RCG_CMD) & RCG_UPDATE)
+		if (ticks() > end)
+			break;
+	if (gcc_branch_on(GCC_SDCC2_AHB_CBCR) || gcc_branch_on(GCC_SDCC2_APPS_CBCR)) {
+		con_hex2("GCC", "still off ahb=", gcc_rd(GCC_SDCC2_AHB_CBCR), "apps=", gcc_rd(GCC_SDCC2_APPS_CBCR));
+		con_str("SD", "clocks did not start: not touching the host");
+		return;
+	}
+	con_hex2("GCC", "on ahb=", gcc_rd(GCC_SDCC2_AHB_CBCR), "rcg cmd=", gcc_rd(GCC_SDCC2_RCG_CMD));
+
+	hc_base = SD_BASE;
+	uint32_t ver = hc_rd(R_VERSION), present = hc_rd(R_PRESENT);
+	con_hex2("HC", "ver=", ver, "present=", present);
+	con_hex2("HC", "hostctl=", hc_rd(R_HOSTCTL), "clock=", hc_rd(R_CLOCK));
+	con_hex2("HC", "pwrctl=", hc_rd(R_PWRCTL_STATUS), "caps=", hc_rd(R_CAPS));
+	if (ver == 0 || ver == 0xffffffff) {
+		con_str("SD", "registers read as 0/ff");
+		return;
+	}
+	/* present: bit 16 card inserted, 17 state stable, 18 card-detect pin */
+	con_hex2("CARD", "inserted=", (present >> 16) & 1, "cd pin=", (present >> 18) & 1);
+
+	/* v2: the card's supplies through the RPM, if ABL left its channel open. */
+	int lcid = rpm_find();
+	if (lcid < 0 && mr_rd(rpm_tx.off + 4) == 0 && mr_rd(rpm_rx.off + 4) == 0)
+		lcid = rpm_open();
+	if (lcid >= 0) {
+		(void)rpm_ldo_on(lcid, 5, 2952000, 0x5d05);	/* vdd-io, 3.3 V signalling */
+		(void)rpm_ldo_on(lcid, 22, 2952000, 0x5d22);	/* vdd */
+		delay_us(10000);
+	} else {
+		con_str("RPM", "no open rpm_requests channel: not asking");
+	}
+
+	/* Full host reset, acknowledged to the msm core (it asks for bus off). */
+	hc_wr(R_CLOCK, hc_rd(R_CLOCK) | (1u << 24));
+	end = ticks() + TIMEOUT_TICKS;
+	while (hc_rd(R_CLOCK) & (1u << 24))
+		if (ticks() > end)
+			break;
+	con_hex2("RESET", "pwrctl=", pwrctl_ack(), "clock=", hc_rd(R_CLOCK));
+
+	hc_wr(R_INT_EN, 0xffff00ff & ~0x100u);
+	hc_wr(R_SIG_EN, 0);
+	hc_wr(R_INT_STAT, 0xffffffff);
+	hc_wr(R_CTRL2, hc_rd(R_CTRL2) & ~(1u << (16 + 3)));	/* 3.3 V signalling */
+	/* Bus power on at 3.3 V: power field 0b111 << 1 | on. */
+	hc_wr(R_HOSTCTL, (hc_rd(R_HOSTCTL) & ~0xff3eu) | (0x0fu << 8));
+	con_hex2("POWER", "on, pwrctl=", pwrctl_ack(), "hostctl=", hc_rd(R_HOSTCTL));
+
+	/* 19.2 MHz / (2 * 24) = 400 kHz for identification; max data timeout. */
+	hc_wr(R_CLOCK, (hc_rd(R_CLOCK) & ~(0xffu << 16)) | (0x0eu << 16));
+	set_clock(24);
+	con_hex2("CLOCK", "400k reg=", hc_rd(R_CLOCK), "present=", hc_rd(R_PRESENT));
+
+	uint32_t resp = 0, st = 0;
+	(void)cmd(0, 0, 0, 0, 0, &resp, &st);
+	delay_us(2000);
+	/* CMD8: 2.7-3.6 V, check pattern 0xaa. No answer = v1 card or no supply. */
+	int e = cmd(8, 0x1aa, C_RESP48 | C_CRC | C_INDEX, 0, 0, &resp, &st);
+	con_hex2("CMD8", "resp=", e ? 0 : resp, "st=", st);
+	if (e)
+		soft_reset_cmd_dat();
+
+	/* ACMD41 with HCS until the card leaves its busy state (up to ~1 s). */
+	uint32_t ocr = 0;
+	for (int i = 0; i < 1000 && !(ocr & (1u << 31)); i++) {
+		if (cmd(55, 0, C_RESP48 | C_CRC | C_INDEX, 0, 0, &resp, &st) ||
+		    cmd(41, 0x40ff8000, C_RESP48, 0, 0, &ocr, &st)) {
+			soft_reset_cmd_dat();
+			ocr = 0;
+		}
+		if (!(ocr & (1u << 31)))
+			delay_us(1000);
+	}
+	con_hex2("ACMD41", "ocr=", ocr, "st=", st);
+	if (!(ocr & (1u << 31))) {
+		con_str("SD", "no ready OCR: card supply off (RPM L22/L5)?");
+		return;
+	}
+	con_hex2("OCR", "ccs (SDHC/XC)=", (ocr >> 30) & 1, "3.3V window=", (ocr >> 20) & 3);
+	if (cmd(2, 0, C_RESP136 | C_CRC, 0, 0, &resp, &st)) {
+		con_hex2("CMD2", "failed st=", st, "", 0);
+		return;
+	}
+	/* R2 without CRC, shifted by 8: MID is the top byte of the last word. */
+	con_hex2("CID", "w3=", hc_rd(R_RESP0 + 12), "w2=", hc_rd(R_RESP0 + 8));
+	if (cmd(3, 0, C_RESP48 | C_CRC | C_INDEX, 0, 0, &resp, &st)) {
+		con_hex2("CMD3", "failed st=", st, "", 0);
+		return;
+	}
+	uint32_t rca = resp >> 16;
+	if (cmd(7, rca << 16, C_RESP48B | C_CRC | C_INDEX, 0, 0, &resp, &st)) {
+		con_hex2("CMD7", "failed st=", st, "rca=", rca);
+		return;
+	}
+	wait_busy();
+	(void)cmd(13, rca << 16, C_RESP48 | C_CRC | C_INDEX, 0, 0, &resp, &st);
+	con_hex2("SELECTED", "rca=", rca, "state=", (resp >> 9) & 0xf);
+
+	/* Default speed is fine for reads: 19.2 MHz / 2 = 9.6 MHz. */
+	set_clock(1);
+	e = cmd(17, 0, C_RESP48 | C_CRC | C_INDEX | C_DATA, M_BLKCNT | M_READ, 1, &resp, &st);
+	if (e) {
+		con_hex2("CMD17", "lba0 e=", (uint32_t)e, "st=", st);
+		soft_reset_cmd_dat();
+		return;
+	}
+	const uint8_t *b = (const uint8_t *)buf;
+	con_hex2("LBA0", "sig=", b[510] | b[511] << 8, "part1 type=", b[450]);
+	con_hex2("LBA0", "part1 start=", b[454] | b[455] << 8 | b[456] << 16 | (uint32_t)b[457] << 24,
+		 "w0=", buf[0]);
+	con_str("SD", (b[510] == 0x55 && b[511] == 0xaa) ? "OK: microSD readable from our code"
+							   : "read done, no MBR signature");
 }
