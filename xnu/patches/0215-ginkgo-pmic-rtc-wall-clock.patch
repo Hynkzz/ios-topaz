@@ -1,0 +1,171 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 65970f9..99e01b5 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -16,6 +16,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
++int sweet_rtc_read(uint32_t *secs);
+ 
+ /* topaz (SM6225, sm6125.dtsi spmi_bus; PM6125 USID 0): PON 0x800, Vol+ = GPIO5 */
+ #define KEYS_CORE_PA     0x01c40000u
+@@ -39,6 +40,17 @@ keys_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++static bool
++keys_map(void)
++{
++	if (keys_core == 0) {
++		keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
++		keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
++		keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
++	}
++	return keys_core && keys_cnfg && keys_obs;
++}
++
+ /* v5 can map one PPID more than once; prefer the apps-owned entry. */
+ static uint16_t
+ keys_find_apid(uint16_t ppid, uint32_t count)
+@@ -137,10 +149,7 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
+-	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
++	if (!keys_map()) {
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+@@ -180,4 +189,48 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++
++/*
++ * PM6125 RTC (USID 0, peripheral 0x60, pm6125.dtsi qcom,pm6125_rtc_rw@6000):
++ * a 32-bit seconds counter, RTC_CTRL 0x46 bit 7 = enabled, RTC_READ 0x48-0x4b
++ * least significant byte first (Linux qpnp-rtc.c). The dtsi has
++ * qcom,qpnp-rtc-write = <0>: the counter is never set, Android adds an
++ * offset it keeps in userspace. Read only, like the keys. Read twice so a
++ * carry between the byte reads is caught. Thread context; may be called
++ * before sweet_keys_init.
++ */
++int
++sweet_rtc_read(uint32_t *secs)
++{
++	static uint16_t rtc_apid = KEYS_NO_APID;
++	if (!keys_map()) {
++		return -1;
++	}
++	if (rtc_apid == KEYS_NO_APID) {
++		uint32_t version = keys_rd(keys_core, 0), count = keys_rd(keys_core, 4) & 0x7ffu;
++		if (version < 0x50000000u || version >= 0x70000000u || count == 0 || count > 512) {
++			return -1;
++		}
++		rtc_apid = keys_find_apid(0x060, count);
++	}
++	uint8_t ctrl = 0;
++	if (!keys_read(rtc_apid, 0x6046, &ctrl) || !(ctrl & 0x80u)) {
++		return -1;
++	}
++	for (int attempt = 0; attempt < 3; attempt++) {
++		uint8_t b[4], again;
++		bool ok = true;
++		for (int i = 0; i < 4 && ok; i++) {
++			ok = keys_read(rtc_apid, (uint16_t)(0x6048 + i), &b[i]);
++		}
++		if (!ok || !keys_read(rtc_apid, 0x6048, &again)) {
++			return -1;
++		}
++		if (again == b[0]) {
++			*secs = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			return 0;
++		}
++	}
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..3f11fc4 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,9 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++extern "C" int sweet_rtc_read(uint32_t *secs);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,8 +21,19 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
++/*
++ * Wall clock from the PMIC RTC (sweet_keys.c), which nobody sets: time is
++ * RTC + offset. The offset comes from boot-arg sweetrtc_off=<seconds>;
++ * when userland sets the time, the matching offset is logged so it can go
++ * into the boot-args (no NVRAM to keep it in) and is used until reboot.
++ */
++static bool rtc_have_off;
++static long rtc_off;
++
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
+ bool
+@@ -30,6 +44,8 @@ SweetPlatformExpert::start(IOService *provider)
+ 		return false;
+ 	}
+ 	registerService();
++	/* IOKitInitializeTime waits up to 30 s for an RTC driver to publish this. */
++	publishResource("IORTC");
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
+@@ -74,6 +90,36 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+ 	}
+ }
+ 
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint32_t raw;
++	if (sweet_rtc_read(&raw) != 0) {
++		IOLog("SWEET RTC: PMIC RTC not readable\n");
++		return 0;
++	}
++	if (!rtc_have_off) {
++		int off = 0;
++		(void)PE_parse_boot_argn("sweetrtc_off", &off, sizeof(off));
++		rtc_off = off;
++		rtc_have_off = true;
++		IOLog("SWEET RTC: raw %u + sweetrtc_off %ld\n", raw, rtc_off);
++	}
++	return (long)raw + rtc_off;
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	uint32_t raw;
++	if (sweet_rtc_read(&raw) != 0) {
++		return;
++	}
++	rtc_off = secs - (long)raw;
++	rtc_have_off = true;
++	IOLog("SWEET RTC: time set to %ld; keep it with boot-arg sweetrtc_off=%ld\n", secs, rtc_off);
++}
++
+ /*
+  * hw.target / hw.product come from IODTPlatformExpert: the first root
+  * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
