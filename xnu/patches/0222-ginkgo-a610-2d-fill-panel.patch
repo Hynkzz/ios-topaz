@@ -1,0 +1,202 @@
+diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
+index 2e60b10..6fbe17f 100644
+--- a/bsd/dev/sweet_a610.c
++++ b/bsd/dev/sweet_a610.c
+@@ -44,6 +44,16 @@
+  *              CP_SET_SECURE_MODE 0 (RBBM_SECVID_TRUST_CNTL is never written:
+  *              on willow that hung the bus). Once per boot.
+  *  12  commands the core to write a word into the scratch page (CP_MEM_WRITE)
++ *  13  commands the 2D engine to fill a 16x64 rectangle in the scratch area
++ *              with one colour (Mesa's fd6_clear_surface, as willow's step 13)
++ *              and reads it back
++ *  14  commands the 2D engine to fill the panel's framebuffer (the boot
++ *              framebuffer the MDP scans with sweetfb_noflip=1, 0x5c000000,
++ *              untranslated like everything else here) with three bands:
++ *              orange, white, blue. The panel's rows are 4320 bytes, the 2D
++ *              engine's must be a multiple of 64: the bands are drawn 1088
++ *              pixels wide on 4352-byte rows over the same bytes, so their
++ *              edges lean by 32 bytes a row.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+@@ -145,6 +155,33 @@ extern uint64_t kvtophys(vm_offset_t va);
+ #define CP_RB_CNTL_VALUE        (12u | 2u << 8 | 1u << 27)      /* 2^12 pairs of words; no read pointer copy */
+ #define PERF_CP_ALWAYS_COUNT    0
+ 
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_BLIT                 0x2c
++#define CP_EVENT_WRITE          0x46
++#define CP_SET_MARKER           0x65
++#define RB_CCU_CNTL             0x8e07
++#define A610_CCU_CNTL_BYPASS    (0x10000u >> 12 << 23)  /* Mesa ccu_offset_bypass: 1 CCU x 64 KB, in 4K */
++#define GRAS_2D_BLIT_CNTL       0x8400
++#define GRAS_2D_DST_TL          0x8405
++#define GRAS_2D_DST_BR          0x8406
++#define RB_2D_BLIT_CNTL         0x8c00
++#define RB_2D_PIXEL_CNTL        0x8c01
++#define RB_2D_DST_INFO          0x8c17
++#define RB_2D_DST               0x8c18
++#define RB_2D_DST_PITCH         0x8c1a
++#define RB_2D_SRC_SOLID_C0      0x8c2c
++#define SP_2D_DST_FORMAT        0xacc0
++#define FORMAT_8888             0x30
++#define BLIT_SOLID_8888         (1u << 7 | FORMAT_8888 << 8 | 0xfu << 20 | 0x10u << 24)
++#define DST_BGRA_LINEAR         (FORMAT_8888 | 1u << 10)
++#define EVENT_FLUSH_COLOR       0x1d
++#define EVENT_CACHE_FLUSH       0x04
++#define FB_PHYS                 0x5c000000UL    /* mkadt.py: cont_splash_region, sweet-fbcon */
++#define FB_ROW                  4320u           /* 1080 x 4 */
++#define FB_HEIGHT               2340u
++#define FILL_ROW                4352u           /* 1088 pixels: the next multiple of 64 bytes */
++#define FILL_HEIGHT             ((FB_ROW * FB_HEIGHT) / FILL_ROW)
++#define TEST_OFFSET             (CORE_SCRATCH_OFFSET + 0x1000u)
+ #define CP_MEM_WRITE            0x3d
+ #define CP_ME_INIT              0x48
+ #define CP_SET_SECURE_MODE      0x66
+@@ -459,6 +496,72 @@ ring_run(const char *what)
+ 	return false;
+ }
+ 
++/* A register of the core (by its word number) written by packet, in order with the other commands. */
++static void
++ring_register(uint32_t number, uint32_t value)
++{
++	ring(4u << 28 | 1 | odd_parity(1) << 7 | number << 8 | odd_parity(number) << 27);
++	ring(value);
++}
++
++/* Mesa's a6xx_gen1_low_raw_magic_regs, the A610's (as willow) */
++static const uint32_t gen1_magic[][2] = {
++	{ 0x9804, 0xf }, { 0x9805, 0 }, { 0xa0f8, 0 }, { 0xb600, 0 }, { 0x8600, 0 }, { 0xae03, 0 }, { 0xae00, 0 },
++	{ 0xbe04, 0 }, { 0x9600, 0 }, { 0x0e12, 0x10000000 }, { 0x8e01, 0x1 }, { 0x8e04, 0x04100000 },
++};
++
++static void
++ring_2d_begin(void)
++{
++	for (unsigned i = 0; i < sizeof(gen1_magic) / sizeof(gen1_magic[0]); i++) {
++		ring_register(gen1_magic[i][0], gen1_magic[i][1]);
++	}
++	ring_command(CP_SET_MARKER, 1);
++	ring(12);                                               /* 2D blits follow */
++	ring_register(RB_CCU_CNTL, A610_CCU_CNTL_BYPASS | 1);   /* bit 0: no GMEM fast clear on the A610 */
++}
++
++/* Rows top..bottom-1, `width` pixels, of a BGRA picture at `target` with rows of `pitch` bytes. */
++static void
++ring_fill(uint64_t target, uint32_t pitch, uint32_t width, uint32_t top, uint32_t bottom,
++    uint32_t red, uint32_t green, uint32_t blue)
++{
++	ring_register(GRAS_2D_DST_TL, top << 16);
++	ring_register(GRAS_2D_DST_BR, (width - 1) | (bottom - 1) << 16);
++	ring_register(RB_2D_SRC_SOLID_C0, red);
++	ring_register(RB_2D_SRC_SOLID_C0 + 1, green);
++	ring_register(RB_2D_SRC_SOLID_C0 + 2, blue);
++	ring_register(RB_2D_SRC_SOLID_C0 + 3, 255);
++	ring_register(RB_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_register(GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_register(SP_2D_DST_FORMAT, 1 | FORMAT_8888 << 3 | 0xfu << 12);
++	ring_register(RB_2D_PIXEL_CNTL, 0);
++	ring_register(RB_2D_DST_INFO, DST_BGRA_LINEAR);
++	ring_register(RB_2D_DST, (uint32_t)target);
++	ring_register(RB_2D_DST + 1, (uint32_t)(target >> 32));
++	ring_register(RB_2D_DST_PITCH, pitch >> 6);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	ring_command(CP_BLIT, 1);
++	ring(3);                                                /* "scale", the 2D engine's one operation */
++}
++
++/* Out of the core's caches into memory; each event writes a word of the scratch page when done. */
++static void
++ring_2d_end(uint32_t tag)
++{
++	ring_command(CP_EVENT_WRITE, 4);
++	ring(EVENT_FLUSH_COLOR);
++	ring((uint32_t)(core_phys + CORE_SCRATCH_OFFSET + 32));
++	ring((uint32_t)((core_phys + CORE_SCRATCH_OFFSET + 32) >> 32));
++	ring(tag);
++	ring_command(CP_EVENT_WRITE, 4);
++	ring(EVENT_CACHE_FLUSH);
++	ring((uint32_t)(core_phys + CORE_SCRATCH_OFFSET + 16));
++	ring((uint32_t)((core_phys + CORE_SCRATCH_OFFSET + 16) >> 32));
++	ring(tag + 1);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++}
++
+ struct named {
+ 	const char *name;
+ 	uint32_t    offset;
+@@ -873,7 +976,63 @@ a610_run(int steps)
+ 			return -12;
+ 		}
+ 	}
+-	return 12;
++	if (steps < 13) {
++		return 12;
++	}
++
++	printf("SWEET A610: step 13: the 2D engine fills 16x64 pixels of the scratch area\n");
++	{
++		volatile uint32_t *test = (volatile uint32_t *)(core_memory + TEST_OFFSET);
++		volatile uint32_t *page = (volatile uint32_t *)(core_memory + CORE_SCRATCH_OFFSET);
++		const uint32_t expect = 0xffff8000;     /* B 00 G 80 R ff A ff, read as a little-endian word */
++
++		for (unsigned i = 0; i < 16 * 64; i++) {
++			test[i] = 0;
++		}
++		to_memory((vm_offset_t)test, 16 * 64 * 4);
++		ring_2d_begin();
++		ring_fill(core_phys + TEST_OFFSET, 64, 16, 0, 64, 255, 128, 0);
++		ring_2d_end(0x0c0c0c0c);
++		if (!ring_run("fill a small picture")) {
++			return -13;
++		}
++		to_memory(core_memory + CORE_SCRATCH_OFFSET, 64);
++		to_memory((vm_offset_t)test, 16 * 64 * 4);
++		printf("SWEET A610: flush words %#x %#x; pixels: first %#x, middle %#x, last %#x (told %#x)\n",
++		    page[8], page[4], test[0], test[16 * 32 + 8], test[16 * 64 - 1], expect);
++		smmu_faults("after the fill");
++		if (test[0] != expect || test[16 * 32 + 8] != expect || test[16 * 64 - 1] != expect) {
++			printf("SWEET A610: the picture is not what the 2D engine was told to draw\n");
++			return -13;
++		}
++		printf("SWEET A610: THE 2D ENGINE DRAWS\n");
++	}
++	if (steps < 14) {
++		return 13;
++	}
++
++	printf("SWEET A610: step 14: three bands into the panel's framebuffer (%#lx)\n", FB_PHYS);
++	{
++		const uint32_t third = FILL_HEIGHT / 3;
++		static vm_offset_t fb;
++
++		ring_2d_begin();
++		ring_fill(FB_PHYS, FILL_ROW, FILL_ROW / 4, 0, third, 255, 128, 0);              /* orange */
++		ring_fill(FB_PHYS, FILL_ROW, FILL_ROW / 4, third, 2 * third, 255, 255, 255);    /* white */
++		ring_fill(FB_PHYS, FILL_ROW, FILL_ROW / 4, 2 * third, FILL_HEIGHT, 0, 128, 255); /* blue */
++		ring_2d_end(0x0e0e0e0e);
++		if (!ring_run("fill the panel")) {
++			return -14;
++		}
++		smmu_faults("after the panel");
++		if (fb == 0) {
++			fb = ml_io_map(FB_PHYS, FB_ROW * FB_HEIGHT);
++		}
++		printf("SWEET A610: framebuffer reads: row 10 %#x, row 1170 %#x, row 2300 %#x\n",
++		    rd(fb + 10 * FB_ROW + 2000), rd(fb + 1170 * FB_ROW + 2000), rd(fb + 2300 * FB_ROW + 2000));
++		printf("SWEET A610: A PICTURE DRAWN BY THE GPU: orange, white, blue from the top\n");
++	}
++	return 14;
+ }
+ 
+ static int
+@@ -891,7 +1050,7 @@ sysctl_sweetgpu SYSCTL_HANDLER_ARGS
+ 	    SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) != kSuccess) {
+ 		return EPERM;   /* ginkgo only, and only with boot-arg sweetgpu=1 */
+ 	}
+-	if (value < 1 || value > 12) {
++	if (value < 1 || value > 14) {
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&a610_lock);
