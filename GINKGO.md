@@ -30,6 +30,7 @@ never in git or CI artifacts.
 | RTC / date | ✅ | 0215: PM6125 RTC (read only) + boot-arg `sweetrtc_off` (per phone: set the time once over ssh, the log prints the value); also ends IOKit's 30 s IORTC wait |
 | Battery % | ⚠️ | 0216: PMI632 QG voltage/current + charger state (read only), SOC estimated from voltage; the charger stays paused under iOS (no charging) |
 | GPU power-up (steps 1-6) | ✅ | 0218: boot-arg `sweetgpu=1`, then `sysctl kern.sweetgpu=6`: CX and GX GDSCs on, 3D core at 19.2 MHz, RBBM_STATUS answers (0x1) |
+| GPU SMMU read, TrustZone, zap shader (steps 7-9) | ✅ | 0219/0220: `sysctl kern.sweetgpu=9`; firmware from the phone's vendor image via `mkpayload.py --gpufw` (not in git); TrustZone accepts the signature and starts the zap shader in gpu_region 0x57515000 |
 | DYLD_* / inserted libraries | ✅ | 0217: the AMFI stand-in answers dyld's policy call |
 | USB networking | ✅ | 0214, boot-args `sweetusb=2 sweethw=1`; phone 192.168.7.2, live log udp/5140 |
 | SSH | ✅ | dropbear from `dropbear.yml` with `tools/dropbear/sweet_pw.c`: libinfo user lookups fail on the port, so OpenSSH rejects every user |
