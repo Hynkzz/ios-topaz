@@ -27,7 +27,7 @@ never in git or CI artifacts.
 | eMMC root | ✅ | |
 | microSD root | ❌ | 0208: card stops after ACMD41/CMD2; log int status before line reset |
 | Brightness (boot-arg) | ✅ | `sweetbl_level=N` (DCS 0x51, two bytes MSB first); iOS slider ❌ |
-| RTC / date | ❌ | starts at Dec 31 |
+| RTC / date | ✅ | 0215: PM6125 RTC (read only) + boot-arg `sweetrtc_off` (per phone: set the time once over ssh, the log prints the value); also ends IOKit's 30 s IORTC wait |
 | Battery % | ❌ | PMI632 QG fuel gauge |
 | USB networking | ✅ | 0214, boot-args `sweetusb=2 sweethw=1`; phone 192.168.7.2, live log udp/5140 |
 | SSH | ✅ | dropbear from `dropbear.yml` with `tools/dropbear/sweet_pw.c`: libinfo user lookups fail on the port, so OpenSSH rejects every user |
