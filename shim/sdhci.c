@@ -705,8 +705,28 @@ static int rpm_ldo_on(int lcid, uint32_t id, uint32_t uv, uint32_t msg_id)
  * rpm_requests first unless an earlier call did. RPM votes outlive the shim:
  * xnu's SD backend (/sweet-sdhci sd-card) relies on them. 0 when both answered.
  */
+/*
+ * SDCC2's root clock on XO (19.2 MHz), no divider, no M/N, branches on.
+ * ABL leaves it at 100 MHz from GPLL0; the probe that identified the card
+ * ran from XO, while xnu's identical command sequence from 100 MHz got
+ * CMD55 errors (2026-11-06), so xnu's SD backend expects XO. 0 when on.
+ */
+static int sd_clock_xo(void)
+{
+	gcc_wr(GCC_SDCC2_RCG_CFG, gcc_rd(GCC_SDCC2_RCG_CFG) & ~((3u << 12) | (7u << 8) | 0x1fu));
+	gcc_wr(GCC_SDCC2_RCG_CMD, gcc_rd(GCC_SDCC2_RCG_CMD) | RCG_UPDATE);
+	uint64_t end = ticks() + TIMEOUT_TICKS;
+	while (gcc_rd(GCC_SDCC2_RCG_CMD) & RCG_UPDATE)
+		if (ticks() > end)
+			break;
+	return gcc_branch_on(GCC_SDCC2_AHB_CBCR) || gcc_branch_on(GCC_SDCC2_APPS_CBCR);
+}
+
 int sd_power_on(void)
 {
+	if (sd_clock_xo())
+		con_str("SD", "SDCC2 clocks did not start on XO");
+	con_hex2("SD", "rcg cfg=", gcc_rd(GCC_SDCC2_RCG_CFG), "apps=", gcc_rd(GCC_SDCC2_APPS_CBCR));
 	int lcid = rpm_find();
 	if (lcid < 0 && rpm_tx.size && mr_rd(rpm_tx.off + 4) == 0 && mr_rd(rpm_rx.off + 4) == 0)
 		lcid = rpm_open();
@@ -727,14 +747,7 @@ void test_sdcard(void)
 	con_hex2("GCC", "ahb=", gcc_rd(GCC_SDCC2_AHB_CBCR), "apps=", gcc_rd(GCC_SDCC2_APPS_CBCR));
 	con_hex2("GCC", "rcg cmd=", gcc_rd(GCC_SDCC2_RCG_CMD), "cfg=", gcc_rd(GCC_SDCC2_RCG_CFG));
 
-	/* Root clock on XO, no divider, no M/N: the host divides it below. */
-	gcc_wr(GCC_SDCC2_RCG_CFG, gcc_rd(GCC_SDCC2_RCG_CFG) & ~((3u << 12) | (7u << 8) | 0x1fu));
-	gcc_wr(GCC_SDCC2_RCG_CMD, gcc_rd(GCC_SDCC2_RCG_CMD) | RCG_UPDATE);
-	uint64_t end = ticks() + TIMEOUT_TICKS;
-	while (gcc_rd(GCC_SDCC2_RCG_CMD) & RCG_UPDATE)
-		if (ticks() > end)
-			break;
-	if (gcc_branch_on(GCC_SDCC2_AHB_CBCR) || gcc_branch_on(GCC_SDCC2_APPS_CBCR)) {
+	if (sd_clock_xo()) {
 		con_hex2("GCC", "still off ahb=", gcc_rd(GCC_SDCC2_AHB_CBCR), "apps=", gcc_rd(GCC_SDCC2_APPS_CBCR));
 		con_str("SD", "clocks did not start: not touching the host");
 		return;
@@ -757,7 +770,7 @@ void test_sdcard(void)
 
 	/* Full host reset, acknowledged to the msm core (it asks for bus off). */
 	hc_wr(R_CLOCK, hc_rd(R_CLOCK) | (1u << 24));
-	end = ticks() + TIMEOUT_TICKS;
+	uint64_t end = ticks() + TIMEOUT_TICKS;
 	while (hc_rd(R_CLOCK) & (1u << 24))
 		if (ticks() > end)
 			break;

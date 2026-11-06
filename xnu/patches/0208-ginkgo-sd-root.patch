@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index c8d92b9..a5f45a3 100644
+index c8d92b9..7e62b35 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -23,6 +23,14 @@
+@@ -23,6 +23,16 @@
   * into the same bounce buffer (allocated below 4 GiB). Device blocks are
   * 512 bytes there, which is also the GPT's LBA size on eMMC.
   *
@@ -10,14 +10,16 @@ index c8d92b9..a5f45a3 100644
 + * host sdhci@4784000) the card is an SDHC/SDXC one instead: the shim has
 + * already asked the RPM for its supplies (ldoa 5/22), sd_init_card() does the
 + * SD identification (CMD8, ACMD41, RCA from CMD3, 4-bit ACMD6) and the
-+ * transfers are the same CMD18/CMD25 (block addressed). ABL leaves the SDCC2
-+ * clock at 100 MHz (GPLL0_AUX2/3), so boot-arg sddiv (default 2) gives the
-+ * 25 MHz default-speed bus. There is no cache to flush on an SD card.
++ * transfers are the same CMD18/CMD25 (block addressed). The shim moves the
++ * SDCC2 root clock from ABL's 100 MHz (GPLL0) to XO, as in its probe that
++ * identified the card (from 100 MHz the same sequence got CMD55 errors), so
++ * the bus runs at 19.2 MHz (boot-arg sddiv, default 0 = undivided). There is
++ * no cache to flush on an SD card.
 + *
   * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
   * against the partition bounds again right before it is issued, so nothing
   * outside the named partition can be written.
-@@ -122,6 +130,8 @@ static struct {
+@@ -122,6 +132,8 @@ static struct {
  	dev_t bdev;
  	bool ready;
  	bool emmc;                              /* ginkgo: SDHCI eMMC instead of UFS */
@@ -26,7 +28,7 @@ index c8d92b9..a5f45a3 100644
  	uint32_t blksz;                         /* device block: 4096 (UFS) or 512 (eMMC) */
  	uint32_t emmc_div;                      /* SDHCI clock divider (boot-arg emmcdiv) */
  } su;
-@@ -170,6 +180,7 @@ dma_clean(uint32_t off, uint32_t len)
+@@ -170,6 +182,7 @@ dma_clean(uint32_t off, uint32_t len)
  #define EM_INT_STAT     0x30
  #define EM_INT_EN       0x34
  #define EM_SIG_EN       0x38
@@ -34,7 +36,7 @@ index c8d92b9..a5f45a3 100644
  #define EM_CAPS         0x40
  #define EM_ADMA_LO      0x58
  #define EM_ADMA_HI      0x5c
-@@ -359,6 +370,9 @@ static int
+@@ -359,6 +372,9 @@ static int
  emmc_flush(void)
  {
  	uint32_t resp = 0;
@@ -44,7 +46,7 @@ index c8d92b9..a5f45a3 100644
  	return emmc_cmd(6, 3u << 24 | 32u << 16 | 1u << 8, EM_R48B | EM_CRC | EM_IDX, &resp);
  }
  
-@@ -413,8 +427,8 @@ emmc_init_card(void)
+@@ -413,8 +429,8 @@ emmc_init_card(void)
  		return ENXIO;
  	}
  	if (emmc_cmd(2, 0, EM_R136 | EM_CRC, NULL) ||
@@ -55,7 +57,7 @@ index c8d92b9..a5f45a3 100644
  		printf("SWEET EMMC: identification failed\n");
  		return EIO;
  	}
-@@ -426,12 +440,96 @@ emmc_init_card(void)
+@@ -426,12 +442,96 @@ emmc_init_card(void)
  		ufs_wr(EM_HOSTCTL, ufs_rd(EM_HOSTCTL) | (1u << 2));
  		emmc_set_clock(su.emmc_div);
  	}
@@ -96,7 +98,7 @@ index c8d92b9..a5f45a3 100644
 +	ufs_wr(EM_HOSTCTL, ufs_rd(EM_HOSTCTL) & ~((1u << 5) | (1u << 2) | (1u << 1) | (3u << 3)));
 +	ufs_wr(EM_CLOCK, (ufs_rd(EM_CLOCK) & ~(0xffu << 16)) | (0x0eu << 16));
 +	(void)base;
-+	emmc_set_clock(125);            /* 400 kHz from ABL's 100 MHz SDCC2 clock (caps says 200) */
++	emmc_set_clock(24);             /* 400 kHz from 19.2 MHz: the shim puts SDCC2 on XO */
 +
 +	su.rca = 0;
 +	(void)emmc_cmd(0, 0, 0, NULL);
@@ -153,7 +155,7 @@ index c8d92b9..a5f45a3 100644
  /*
   * One SCSI command in slot 0, data (if any) to/from the bounce buffer
   * (to the device when write is set). Returns 0 or an errno.
-@@ -1049,6 +1147,9 @@ sweet_ufs_init(void)
+@@ -1049,6 +1149,9 @@ sweet_ufs_init(void)
  		su.emmc = false;
  	} else if (SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) == kSuccess) {
  		su.emmc = true;                 /* ginkgo */
@@ -163,19 +165,19 @@ index c8d92b9..a5f45a3 100644
  	} else {
  		printf("SWEET UFS: no /sweet-ufs or /sweet-sdhci node in the device tree\n");
  		return ENXIO;
-@@ -1061,6 +1162,11 @@ sweet_ufs_init(void)
+@@ -1061,6 +1164,11 @@ sweet_ufs_init(void)
  	su.blksz = su.emmc ? 512u : 4096u;
  	su.emmc_div = 4;                        /* <= 50 MHz even from a 400 MHz source */
  	PE_parse_boot_argn("emmcdiv", &su.emmc_div, sizeof(su.emmc_div));
 +	su.rca = 1;
 +	if (su.sd) {
-+		su.emmc_div = 2;                /* 25 MHz from ABL's 100 MHz SDCC2 clock */
++		su.emmc_div = 0;                /* 19.2 MHz: SDCC2 on XO (shim), undivided */
 +		PE_parse_boot_argn("sddiv", &su.emmc_div, sizeof(su.emmc_div));
 +	}
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
  	uint32_t rw = 0;
  	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
-@@ -1087,7 +1193,14 @@ sweet_ufs_init(void)
+@@ -1087,7 +1195,14 @@ sweet_ufs_init(void)
  	su.secsize = DEV_BSIZE;
  
  	lck_mtx_lock(&sweet_ufs_lock);
