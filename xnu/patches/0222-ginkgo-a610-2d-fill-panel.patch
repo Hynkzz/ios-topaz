@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
-index 2e60b10..6fbe17f 100644
+index 2e60b10..49679a6 100644
 --- a/bsd/dev/sweet_a610.c
 +++ b/bsd/dev/sweet_a610.c
 @@ -44,6 +44,16 @@
@@ -126,7 +126,7 @@ index 2e60b10..6fbe17f 100644
  struct named {
  	const char *name;
  	uint32_t    offset;
-@@ -873,7 +976,63 @@ a610_run(int steps)
+@@ -873,7 +976,73 @@ a610_run(int steps)
  			return -12;
  		}
  	}
@@ -169,7 +169,7 @@ index 2e60b10..6fbe17f 100644
 +	printf("SWEET A610: step 14: three bands into the panel's framebuffer (%#lx)\n", FB_PHYS);
 +	{
 +		const uint32_t third = FILL_HEIGHT / 3;
-+		static vm_offset_t fb;
++		static vm_offset_t fb_page[3];
 +
 +		ring_2d_begin();
 +		ring_fill(FB_PHYS, FILL_ROW, FILL_ROW / 4, 0, third, 255, 128, 0);              /* orange */
@@ -180,18 +180,28 @@ index 2e60b10..6fbe17f 100644
 +			return -14;
 +		}
 +		smmu_faults("after the panel");
-+		if (fb == 0) {
-+			fb = ml_io_map(FB_PHYS, FB_ROW * FB_HEIGHT);
++		{
++			/* one page per pixel read: the whole 10 MB is more kernel address space than ml_io_map has */
++			static const uint32_t rows[3] = { 10, 1170, 2300 };
++			uint32_t px[3];
++
++			for (int i = 0; i < 3; i++) {
++				uint64_t at = FB_PHYS + rows[i] * FB_ROW + 2000;
++
++				if (fb_page[i] == 0) {
++					fb_page[i] = ml_io_map(at & ~0xfffull, 0x1000);
++				}
++				px[i] = rd(fb_page[i] + (at & 0xfff));
++			}
++			printf("SWEET A610: framebuffer reads: row 10 %#x, row 1170 %#x, row 2300 %#x\n", px[0], px[1], px[2]);
 +		}
-+		printf("SWEET A610: framebuffer reads: row 10 %#x, row 1170 %#x, row 2300 %#x\n",
-+		    rd(fb + 10 * FB_ROW + 2000), rd(fb + 1170 * FB_ROW + 2000), rd(fb + 2300 * FB_ROW + 2000));
 +		printf("SWEET A610: A PICTURE DRAWN BY THE GPU: orange, white, blue from the top\n");
 +	}
 +	return 14;
  }
  
  static int
-@@ -891,7 +1050,7 @@ sysctl_sweetgpu SYSCTL_HANDLER_ARGS
+@@ -891,7 +1060,7 @@ sysctl_sweetgpu SYSCTL_HANDLER_ARGS
  	    SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) != kSuccess) {
  		return EPERM;   /* ginkgo only, and only with boot-arg sweetgpu=1 */
  	}
