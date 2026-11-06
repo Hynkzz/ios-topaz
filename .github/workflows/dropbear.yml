@@ -1,0 +1,53 @@
+name: dropbear
+
+# dropbear (SSH server) for the iOS port: arm64 iOS 16, ad-hoc signed, with
+# tools/dropbear/sweet_pw.c (getpwnam/getpwuid from /etc/master.passwd)
+# linked in, because libinfo's user lookups fail on the port.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macos-15 (arm64) or macos-15-intel when the arm64 queue is long
+        default: macos-15-intel
+  push:
+    branches: [main, ginkgo-sd]
+    paths:
+      - "tools/dropbear/**"
+      - ".github/workflows/dropbear.yml"
+
+env:
+  DROPBEAR_TAG: DROPBEAR_2025.88
+  DROPBEAR_SHA: 887241694277b3816da5d174932c10546ea9d2c5
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch dropbear
+        run: |
+          git clone --depth 1 -b "$DROPBEAR_TAG" https://github.com/mkj/dropbear src
+          test "$(git -C src rev-parse HEAD)" = "$DROPBEAR_SHA"
+          cp tools/dropbear/localoptions.h src/
+      - name: Build
+        working-directory: src
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          export CC="$(xcrun -sdk iphoneos -f clang)"
+          export CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=16.0 -Os"
+          $CC $CFLAGS -c ../tools/dropbear/sweet_pw.c -o sweet_pw.o
+          export LDFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=16.0 $PWD/sweet_pw.o"
+          ./configure --host=aarch64-apple-darwin --disable-zlib --disable-syslog \
+            --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
+            --disable-pututline --disable-pututxline --disable-harden
+          make -j"$(sysctl -n hw.ncpu)" PROGRAMS="dropbear dropbearkey"
+          nm -m dropbear | grep -E ' _getpw(nam|uid)$'
+          codesign -f -s - dropbear dropbearkey
+          file dropbear dropbearkey
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dropbear-ios-arm64
+          path: |
+            src/dropbear
+            src/dropbearkey
