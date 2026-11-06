@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
-index 0c172ca..f5cc5c4 100644
+index 0c172ca..2e60b10 100644
 --- a/bsd/dev/sweet_a610.c
 +++ b/bsd/dev/sweet_a610.c
 @@ -34,11 +34,22 @@
@@ -186,7 +186,18 @@ index 0c172ca..f5cc5c4 100644
  struct named {
  	const char *name;
  	uint32_t    offset;
-@@ -563,7 +712,170 @@ a610_run(int steps)
+@@ -527,9 +676,7 @@ a610_run(int steps)
+ 	printf("SWEET A610: step 9: the zap shader\n");
+ 	if (zap_loaded) {
+ 		printf("SWEET A610: already in\n");
+-		return 9;
+-	}
+-	{
++	} else {
+ 		uint64_t phys = 0, answer = ~0ull;
+ 		uint32_t size = 0, segments;
+ 		const uint8_t *header = gpufw_file("a610_zap.mdt", &phys, &size);
+@@ -563,7 +710,170 @@ a610_run(int steps)
  		}
  		zap_loaded = true;
  	}
@@ -358,7 +369,7 @@ index 0c172ca..f5cc5c4 100644
  }
  
  static int
-@@ -581,7 +893,7 @@ sysctl_sweetgpu SYSCTL_HANDLER_ARGS
+@@ -581,7 +891,7 @@ sysctl_sweetgpu SYSCTL_HANDLER_ARGS
  	    SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) != kSuccess) {
  		return EPERM;   /* ginkgo only, and only with boot-arg sweetgpu=1 */
  	}
