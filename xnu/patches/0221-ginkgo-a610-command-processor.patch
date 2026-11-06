@@ -1,0 +1,369 @@
+diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
+index 0c172ca..f5cc5c4 100644
+--- a/bsd/dev/sweet_a610.c
++++ b/bsd/dev/sweet_a610.c
+@@ -34,11 +34,22 @@
+  *              .b0N segments copied there, PAS_AUTH_AND_RESET. The files
+  *              come from the payload (mkpayload.py --gpufw, ADT memory-map
+  *              "GPUFirmware"), never from this repository. Once per boot.
++ *  10  writes  memory of ours, physically in one piece: the ring, the SQE
++ *              microcode (a630_sqe.fw less its first word), a scratch page
++ *  11  writes  the GPU's stream to SMMU context 4 with translation off
++ *              (arm-smmu-qcom.c's bypass_quirk: the hypervisor turns a plain
++ *              bypass S2CR into "fault"), the GBIF out of halt, the A610
++ *              registers of Linux's a6xx_hw_init, then starts the command
++ *              processor: CP_ME_INIT, and with the zap shader in
++ *              CP_SET_SECURE_MODE 0 (RBBM_SECVID_TRUST_CNTL is never written:
++ *              on willow that hung the bus). Once per boot.
++ *  12  commands the core to write a word into the scratch page (CP_MEM_WRITE)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+ #include <kern/clock.h>
+ #include <kern/locks.h>
++#include <vm/vm_kern.h>
+ #include <machine/machine_routines.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+@@ -84,6 +95,66 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define MDT_TYPE_HASH           2
+ 
+ extern int IODTGetLoaderInfo(const char *key, void **infoAddr, int *infoSize);
++extern uint64_t kvtophys(vm_offset_t va);
++
++#define GPU_WORD(n)             (4u * (n))
++#define RBBM_GBIF_CLIENT_QOS_CNTL GPU_WORD(0x0011)
++#define RBBM_GBIF_HALT          GPU_WORD(0x0016)
++#define RBBM_GBIF_HALT_ACK      GPU_WORD(0x0017)
++#define RBBM_INTERFACE_HANG_INT_CNTL GPU_WORD(0x001f)
++#define RBBM_INT_0_STATUS       GPU_WORD(0x0201)
++#define RBBM_STATUS             GPU_WORD(0x0210)
++#define RBBM_PERFCTR_CNTL       GPU_WORD(0x0500)
++#define RBBM_PERFCTR_GPU_BUSY_MASKED GPU_WORD(0x050b)
++#define RBBM_NC_MODE_CNTL       GPU_WORD(0x0534)
++#define CP_RB_BASE              GPU_WORD(0x0800)
++#define CP_RB_CNTL              GPU_WORD(0x0802)
++#define CP_RB_RPTR              GPU_WORD(0x0806)
++#define CP_RB_WPTR              GPU_WORD(0x0807)
++#define CP_SQE_CNTL             GPU_WORD(0x0808)
++#define CP_HW_FAULT             GPU_WORD(0x0821)
++#define CP_INTERRUPT_STATUS     GPU_WORD(0x0823)
++#define CP_PROTECT_STATUS       GPU_WORD(0x0824)
++#define CP_SQE_INSTR_BASE       GPU_WORD(0x0830)
++#define CP_ROQ_THRESHOLDS_1     GPU_WORD(0x08c1)
++#define CP_ROQ_THRESHOLDS_2     GPU_WORD(0x08c2)
++#define CP_MEM_POOL_SIZE        GPU_WORD(0x08c3)
++#define CP_PERFCTR_CP_SEL_0     GPU_WORD(0x08d0)
++#define CP_AHB_CNTL             GPU_WORD(0x098d)
++#define UCHE_MODE_CNTL          GPU_WORD(0x0e01)
++#define UCHE_WRITE_RANGE_MAX    GPU_WORD(0x0e05)
++#define UCHE_WRITE_THRU_BASE    GPU_WORD(0x0e07)
++#define UCHE_TRAP_BASE          GPU_WORD(0x0e09)
++#define UCHE_GMEM_RANGE_MIN     GPU_WORD(0x0e0b)
++#define UCHE_GMEM_RANGE_MAX     GPU_WORD(0x0e0d)
++#define UCHE_CACHE_WAYS         GPU_WORD(0x0e17)
++#define UCHE_FILTER_CNTL        GPU_WORD(0x0e18)
++#define UCHE_CLIENT_PF          GPU_WORD(0x0e19)
++#define GBIF_QSB_SIDE0          GPU_WORD(0x3c03)        /* to 3 */
++#define GBIF_HALT               GPU_WORD(0x3c45)
++#define GBIF_HALT_ACK           GPU_WORD(0x3c46)
++#define RB_NC_MODE_CNTL         GPU_WORD(0x8e08)
++#define PC_DBG_ECO_CNTL         GPU_WORD(0x9e00)
++#define SP_NC_MODE_CNTL         GPU_WORD(0xae02)
++#define TPL1_NC_MODE_CNTL       GPU_WORD(0xb604)
++#define RBBM_SECVID_TRUST_CNTL  GPU_WORD(0xf400)
++#define RBBM_SECVID_TSB_TRUSTED_BASE GPU_WORD(0xf800)
++#define RBBM_SECVID_TSB_TRUSTED_SIZE GPU_WORD(0xf802)
++#define RBBM_SECVID_TSB_CNTL    GPU_WORD(0xf803)
++#define GMEM_SIZE               (128u * 1024 + 4096)    /* adreno_device.c: SZ_128K + SZ_4K */
++#define CP_RB_CNTL_VALUE        (12u | 2u << 8 | 1u << 27)      /* 2^12 pairs of words; no read pointer copy */
++#define PERF_CP_ALWAYS_COUNT    0
++
++#define CP_MEM_WRITE            0x3d
++#define CP_ME_INIT              0x48
++#define CP_SET_SECURE_MODE      0x66
++
++#define CORE_RING_SIZE          0x8000u
++#define CORE_SQE_OFFSET         0x8000u
++#define CORE_SQE_MAX            0x10000u
++#define CORE_SCRATCH_OFFSET     0x18000u
++#define CORE_MEMORY_SIZE        0x20000u
++#define RING_WORDS              (CORE_RING_SIZE / 4)
+ 
+ #define CLOCK_OFF               (1u << 31)      /* branch control: the clock does not run */
+ #define CLOCK_ENABLE            (1u << 0)
+@@ -95,7 +166,10 @@ extern int IODTGetLoaderInfo(const char *key, void **infoAddr, int *infoSize);
+ 
+ static vm_offset_t gcc, gpucc, gpu, qfprom, smmu;
+ static int a610_done;
+-static bool zap_loaded;
++static bool zap_loaded, cp_running;
++static vm_offset_t core_memory;         /* ring, microcode, scratch page: one piece */
++static uint64_t core_phys;
++static uint32_t ring_at, ring_sent;
+ static LCK_GRP_DECLARE(a610_grp, "sweet_a610");
+ static LCK_MTX_DECLARE(a610_lock, &a610_grp);
+ 
+@@ -310,6 +384,81 @@ zap_load(const uint8_t *header, uint32_t segments)
+ 	return true;
+ }
+ 
++static void
++to_memory(vm_offset_t start, vm_size_t size)
++{
++	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__builtin_arm_dsb(0xf);
++}
++
++static void
++put64(vm_offset_t reg, uint64_t value)
++{
++	wr(reg, (uint32_t)value);
++	wr(reg + 4, (uint32_t)(value >> 32));
++}
++
++static uint32_t
++odd_parity(uint32_t v)
++{
++	return 0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28)) & 1;
++}
++
++static void
++ring(uint32_t word)
++{
++	((uint32_t *)core_memory)[ring_at] = word;
++	ring_at = (ring_at + 1) % RING_WORDS;
++}
++
++/* PM4 type 7 packet header */
++static void
++ring_command(uint32_t command, uint32_t words)
++{
++	ring(7u << 28 | words | odd_parity(words) << 15 | command << 16 | odd_parity(command) << 23);
++}
++
++static void
++smmu_faults(const char *when)
++{
++	printf("SWEET A610: SMMU %s: sGFSR %#x sGFSYNR0 %#x sGFSYNR1 %#x; context 4 FSR %#x FAR %#x:%#x FSYNR0 %#x\n", when,
++	    rd(smmu + 0x48), rd(smmu + 0x50), rd(smmu + 0x54), rd(smmu + 0xc000 + 0x58), rd(smmu + 0xc000 + 0x64),
++	    rd(smmu + 0xc000 + 0x60), rd(smmu + 0xc000 + 0x68));
++}
++
++/* What was put into the ring out to memory and to the core, then up to 2 s for it to be read and idle. */
++static bool
++ring_run(const char *what)
++{
++	uint32_t taken = ~0u, status = ~0u;
++
++	printf("SWEET A610: the core is to %s: ring up to word %u\n", what, ring_at);
++	if (ring_at >= ring_sent) {
++		to_memory(core_memory + 4 * ring_sent, 4 * (ring_at - ring_sent));
++	} else {
++		to_memory(core_memory + 4 * ring_sent, 4 * (RING_WORDS - ring_sent));
++		to_memory(core_memory, 4 * ring_at);
++	}
++	ring_sent = ring_at;
++	wr(gpu + CP_RB_WPTR, ring_at);
++	for (int i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
++		delay_for_interval(100, NSEC_PER_USEC);
++		taken = rd(gpu + CP_RB_RPTR);
++		status = rd(gpu + RBBM_STATUS);
++	}
++	if (taken == ring_at && !(status & ~1u) && rd(gpu + CP_HW_FAULT) == 0) {
++		printf("SWEET A610: done (ring read up to %u, status %#x)\n", taken, status);
++		return true;
++	}
++	printf("SWEET A610: NOT done: ring read %u of %u, status %#x, int %#x, CP fault %#x int %#x protect %#x\n",
++	    taken, ring_at, status, rd(gpu + RBBM_INT_0_STATUS), rd(gpu + CP_HW_FAULT), rd(gpu + CP_INTERRUPT_STATUS),
++	    rd(gpu + CP_PROTECT_STATUS));
++	smmu_faults("now");
++	return false;
++}
++
+ struct named {
+ 	const char *name;
+ 	uint32_t    offset;
+@@ -563,7 +712,170 @@ a610_run(int steps)
+ 		}
+ 		zap_loaded = true;
+ 	}
+-	return 9;
++	if (steps < 10) {
++		return 9;
++	}
++
++	printf("SWEET A610: step 10: ring, microcode, scratch page\n");
++	if (core_memory == 0) {
++		uint64_t phys = 0;
++		uint32_t size = 0;
++		const uint8_t *microcode = gpufw_file("a630_sqe.fw", &phys, &size);
++
++		if (microcode == NULL || size < 8 || size - 4 > CORE_SQE_MAX) {
++			printf("SWEET A610: no usable a630_sqe.fw in GPUFirmware\n");
++			return -10;
++		}
++		if (kmem_alloc_contig(kernel_map, &core_memory, CORE_MEMORY_SIZE, PAGE_MASK, 0, 0,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			core_memory = 0;
++			printf("SWEET A610: no memory in one piece\n");
++			return -10;
++		}
++		core_phys = kvtophys(core_memory);
++		if (kvtophys(core_memory + CORE_MEMORY_SIZE - PAGE_SIZE) != core_phys + CORE_MEMORY_SIZE - PAGE_SIZE) {
++			printf("SWEET A610: the memory is not one piece physically\n");
++			return -10;
++		}
++		memcpy((void *)(core_memory + CORE_SQE_OFFSET), microcode + 4, size - 4);  /* first word is not microcode */
++		to_memory(core_memory, CORE_MEMORY_SIZE);
++	}
++	printf("SWEET A610: ring at %#llx, microcode at %#llx, scratch at %#llx\n", core_phys,
++	    core_phys + CORE_SQE_OFFSET, core_phys + CORE_SCRATCH_OFFSET);
++	if (steps < 11) {
++		return 10;
++	}
++
++	printf("SWEET A610: step 11: SMMU bypass context, a6xx_hw_init, command processor\n");
++	if (cp_running) {
++		printf("SWEET A610: already running\n");
++	} else {
++		static const uint32_t address_modes[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601,
++			                                  0x0e00, 0xae01, 0xb601, 0xf810 };
++		static const uint32_t smrs[] = { 1u << 31 | 1u << 16 | 0, 1u << 31 | 0 };  /* gfx3d_user SID 0 mask 1; SID 0 */
++		const uint32_t cb = 4;
++		vm_offset_t cbase = smmu + 0x8000 + 0x1000 * cb;
++
++		if (smmu == 0) {
++			return -11;
++		}
++		wr(cbase + 0x00, 0);                            /* SCTLR: translation off */
++		wr(cbase + 0x58, rd(cbase + 0x58));             /* FSR: clear */
++		wr(smmu + 0x1800 + 4 * cb, 1);                  /* CBA2R: 64-bit */
++		wr(smmu + 0x1000 + 4 * cb, 1u << 16);           /* CBAR: S1 translation, S2 bypass */
++		wr(smmu + 0xc00, cb);                           /* S2CR 0: translate, context 4 */
++		for (unsigned i = 0; i < 2; i++) {
++			wr(smmu + 0x800, smrs[i]);
++			if (rd(smmu + 0x800) == smrs[i]) {
++				break;
++			}
++		}
++		printf("SWEET A610: SMMU SMR0 %#x S2CR0 %#x CBAR4 %#x CBA2R4 %#x SCTLR4 %#x sGFSR %#x (%s)\n",
++		    rd(smmu + 0x800), rd(smmu + 0xc00), rd(smmu + 0x1000 + 4 * cb), rd(smmu + 0x1800 + 4 * cb), rd(cbase),
++		    rd(smmu + 0x48), (rd(smmu + 0x800) >> 31) && (rd(smmu + 0xc00) & 0x300ff) == cb ?
++		    "the GPU stream to a context that does not translate" : "NOT taken");
++		printf("SWEET A610: GBIF halt %#x ack %#x, RBBM halt %#x ack %#x\n", rd(gpu + GBIF_HALT),
++		    rd(gpu + GBIF_HALT_ACK), rd(gpu + RBBM_GBIF_HALT), rd(gpu + RBBM_GBIF_HALT_ACK));
++		wr(gpu + GBIF_HALT, 0);
++		(void)rd(gpu + GBIF_HALT);
++		wr(gpu + RBBM_GBIF_HALT, 0);
++		(void)rd(gpu + RBBM_GBIF_HALT);
++		wr(gpu + RBBM_SECVID_TSB_CNTL, 0);
++		put64(gpu + RBBM_SECVID_TSB_TRUSTED_BASE, 0);
++		wr(gpu + RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++		for (unsigned i = 0; i < sizeof(address_modes) / sizeof(address_modes[0]); i++) {
++			wr(gpu + GPU_WORD(address_modes[i]), 1);        /* 64-bit addresses */
++		}
++		for (unsigned i = 0; i < 4; i++) {
++			wr(gpu + GBIF_QSB_SIDE0 + 4 * i, 0x00071620);
++		}
++		wr(gpu + RBBM_GBIF_CLIENT_QOS_CNTL, 3);
++		wr(gpu + RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++		put64(gpu + UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
++		put64(gpu + UCHE_TRAP_BASE, 0x0001fffffffff000ull);
++		put64(gpu + UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
++		put64(gpu + UCHE_GMEM_RANGE_MIN, 0x00100000);
++		put64(gpu + UCHE_GMEM_RANGE_MAX, 0x00100000 + GMEM_SIZE - 1);
++		wr(gpu + UCHE_FILTER_CNTL, 0x804);
++		wr(gpu + UCHE_CACHE_WAYS, 0x4);
++		/* UBWC: a6xx_set_ubwc_config with the A610's numbers */
++		wr(gpu + RB_NC_MODE_CNTL, 1u << 3 | 1);
++		wr(gpu + TPL1_NC_MODE_CNTL, 1u << 3 | 1);
++		wr(gpu + SP_NC_MODE_CNTL, 1u << 3 | 1);
++		wr(gpu + UCHE_MODE_CNTL, 1u << 23);
++		wr(gpu + RBBM_NC_MODE_CNTL, 0);
++		wr(gpu + CP_ROQ_THRESHOLDS_2, 0x00800060);
++		wr(gpu + CP_ROQ_THRESHOLDS_1, 0x40201b16);
++		wr(gpu + CP_MEM_POOL_SIZE, 48);
++		wr(gpu + PC_DBG_ECO_CNTL, 0x00080000);
++		wr(gpu + CP_AHB_CNTL, 1);
++		wr(gpu + RBBM_PERFCTR_CNTL, 1);
++		wr(gpu + CP_PERFCTR_CP_SEL_0, PERF_CP_ALWAYS_COUNT);
++		wr(gpu + RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x3ffff);
++		wr(gpu + UCHE_CLIENT_PF, 1u << 7 | 1);
++		put64(gpu + CP_SQE_INSTR_BASE, core_phys + CORE_SQE_OFFSET);
++		put64(gpu + CP_RB_BASE, core_phys);
++		wr(gpu + CP_RB_CNTL, CP_RB_CNTL_VALUE);
++		printf("SWEET A610: microcode %#x:%#x ring %#x:%#x control %#x status %#x\n", rd(gpu + CP_SQE_INSTR_BASE + 4),
++		    rd(gpu + CP_SQE_INSTR_BASE), rd(gpu + CP_RB_BASE + 4), rd(gpu + CP_RB_BASE), rd(gpu + CP_RB_CNTL),
++		    rd(gpu + RBBM_STATUS));
++		printf("SWEET A610: next: CP_SQE_CNTL = 1\n");
++		wr(gpu + CP_SQE_CNTL, 1);
++		cp_running = true;
++		delay_for_interval(20, NSEC_PER_MSEC);
++		printf("SWEET A610: alive; status %#x int %#x CP fault %#x int %#x protect %#x rptr %u\n", rd(gpu + RBBM_STATUS),
++		    rd(gpu + RBBM_INT_0_STATUS), rd(gpu + CP_HW_FAULT), rd(gpu + CP_INTERRUPT_STATUS),
++		    rd(gpu + CP_PROTECT_STATUS), rd(gpu + CP_RB_RPTR));
++		ring_command(CP_ME_INIT, 8);    /* a6xx_cp_init */
++		ring(0x0000002f);
++		ring(0x00000003);               /* several hardware contexts */
++		ring(0x20000000);               /* error detection */
++		for (int i = 0; i < 5; i++) {
++			ring(0);
++		}
++		if (!ring_run("initialize (CP_ME_INIT)")) {
++			return -11;
++		}
++		printf("SWEET A610: THE 3D CORE TAKES COMMANDS\n");
++		if (zap_loaded) {
++			printf("SWEET A610: TRUST_CNTL %#x before CP_SET_SECURE_MODE 0\n", rd(gpu + RBBM_SECVID_TRUST_CNTL));
++			ring_command(CP_SET_SECURE_MODE, 1);
++			ring(0);
++			if (!ring_run("leave secure mode")) {
++				return -11;
++			}
++			printf("SWEET A610: TRUST_CNTL %#x after it%s\n", rd(gpu + RBBM_SECVID_TRUST_CNTL),
++			    rd(gpu + RBBM_SECVID_TRUST_CNTL) == 0 ? ": OUT OF SECURE MODE" : "");
++		}
++	}
++	if (steps < 12) {
++		return 11;
++	}
++
++	printf("SWEET A610: step 12: a word written on command\n");
++	{
++		volatile uint32_t *page = (volatile uint32_t *)(core_memory + CORE_SCRATCH_OFFSET);
++		uint64_t target = core_phys + CORE_SCRATCH_OFFSET;
++		uint32_t word = 0x600dc0de ^ ring_at;
++
++		page[0] = 0;
++		to_memory((vm_offset_t)page, 64);
++		ring_command(CP_MEM_WRITE, 3);
++		ring((uint32_t)target);
++		ring((uint32_t)(target >> 32));
++		ring(word);
++		if (!ring_run("write a word to memory")) {
++			return -12;
++		}
++		to_memory((vm_offset_t)page, 64);
++		printf("SWEET A610: the page reads %#x (told %#x): %s\n", page[0], word,
++		    page[0] == word ? "THE 3D CORE WRITES OUR MEMORY ON COMMAND" : "not what it was told");
++		smmu_faults("after the write");
++		if (page[0] != word) {
++			return -12;
++		}
++	}
++	return 12;
+ }
+ 
+ static int
+@@ -581,7 +893,7 @@ sysctl_sweetgpu SYSCTL_HANDLER_ARGS
+ 	    SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) != kSuccess) {
+ 		return EPERM;   /* ginkgo only, and only with boot-arg sweetgpu=1 */
+ 	}
+-	if (value < 1 || value > 9) {
++	if (value < 1 || value > 12) {
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&a610_lock);
