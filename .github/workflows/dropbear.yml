@@ -34,14 +34,16 @@ jobs:
         working-directory: src
         run: |
           SDK=$(xcrun -sdk iphoneos --show-sdk-path)
-          export CC="$(xcrun -sdk iphoneos -f clang)"
-          export CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=16.0 -Os"
+          # target flags in CC itself: configure's preprocessor-only checks
+          # (types like socklen_t) do not see CFLAGS
+          export CC="$(xcrun -sdk iphoneos -f clang) -arch arm64 -isysroot $SDK -miphoneos-version-min=16.0"
+          export CFLAGS="-Os"
           $CC $CFLAGS -c ../tools/dropbear/sweet_pw.c -o sweet_pw.o
-          export LDFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=16.0 $PWD/sweet_pw.o"
           ./configure --host=aarch64-apple-darwin --disable-zlib --disable-syslog \
             --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx \
             --disable-pututline --disable-pututxline --disable-harden
-          make -j"$(sysctl -n hw.ncpu)" PROGRAMS="dropbear dropbearkey"
+          # sweet_pw.o only at the final link, so dropbear's getpwnam binds to it
+          make -j"$(sysctl -n hw.ncpu)" PROGRAMS="dropbear dropbearkey" LDFLAGS="$PWD/sweet_pw.o"
           nm -m dropbear | grep -E ' _getpw(nam|uid)$'
           codesign -f -s - dropbear dropbearkey
           file dropbear dropbearkey
