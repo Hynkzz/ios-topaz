@@ -26,10 +26,11 @@ never in git or CI artifacts.
 | Buttons | ✅ | |
 | eMMC root | ✅ | |
 | microSD root | ❌ | 0208: card stops after ACMD41/CMD2; log int status before line reset |
-| Brightness slider | ❌ | panel brightness is DCS 0x51 over DSI (`bl_ctrl_dcs`), ABL leaves 0xb8 |
+| Brightness (boot-arg) | ✅ | `sweetbl_level=N` (DCS 0x51, two bytes MSB first); iOS slider ❌ |
 | RTC / date | ❌ | starts at Dec 31 |
 | Battery % | ❌ | PMI632 QG fuel gauge |
-| USB networking | ❌ | works on sweet (CDC-ECM); DWC3/QUSB2 on ginkgo to check |
+| USB networking | ✅ | 0214, boot-args `sweetusb=2 sweethw=1`; phone 192.168.7.2, live log udp/5140 |
+| SSH | ✅ | dropbear from `dropbear.yml` with `tools/dropbear/sweet_pw.c`: libinfo user lookups fail on the port, so OpenSSH rejects every user |
 | CPU cores | 4 | `cpus=4`: the 16K-page kernel runs on the A73 cores only (A53 has no 16K granule — verify) |
 | GPU (Adreno 610) | ❌ | software rendering; willow-hackios has power-up + Mesa freedreno |
 | Wi-Fi, cellular, BT, audio, camera, sensors | ❌ | |
