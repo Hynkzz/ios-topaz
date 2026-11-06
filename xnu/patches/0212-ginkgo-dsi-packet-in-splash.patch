@@ -1,0 +1,140 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0b6a940..7c32fdb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -71,6 +71,7 @@ static AppleCLCD *sweet_cons_fb;
+ static void sweet_cons_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
++static void sweet_smmu_report(uint32_t stream);
+ extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -189,6 +190,9 @@ public:
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
+ 	volatile uint8_t *fDsi;
++	volatile uint32_t *fDsiSplash;  /* ginkgo: packet inside ABL's splash region (SMMU-mapped for MDSS) */
++	uint64_t      fDsiSplashPhys;
++	uint32_t      fDsiLogs;
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
+@@ -316,6 +320,20 @@ AppleCLCD::start(IOService *provider)
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
++		/*
++		 * ginkgo: MDSS (stream 0x400) goes through the apps SMMU, which ABL
++		 * set up for its splash region (0x5c000000, 15 MiB, trinket.dtsi
++		 * cont_splash_region) only: a command packet elsewhere is fetched
++		 * as nothing, though CMD_DMA_DONE fires. Put it past the boot
++		 * framebuffer, in that region (sweetbl_buf=0: the kernel buffer).
++		 */
++		uint32_t splash = fHeight == 2340 ? 1 : 0;
++		(void)PE_parse_boot_argn("sweetbl_buf", &splash, sizeof(splash));
++		if (splash) {
++			fDsiSplashPhys = 0x5ce00000;
++			fDsiSplash = (volatile uint32_t *)ml_io_map(fDsiSplashPhys, 0x1000);
++		}
++		sweet_smmu_report(0x400);
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+ 		/*
+ 		 * Off unless sweetbl=1: with a backlight service CoreBrightness also
+@@ -608,6 +626,39 @@ static inline void dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * Read-only look at the apps SMMU (SMMUv2 at 0x0c600000, sm6125) for one
++ * stream: which stream-match entries take it and what their context bank
++ * does (bypass / fault / translate with which tables).
++ */
++static void
++sweet_smmu_report(uint32_t stream)
++{
++	volatile uint32_t *g = (volatile uint32_t *)ml_io_map(0x0c600000, 0x80000);
++	if (g == NULL) {
++		return;
++	}
++	uint32_t cr0 = g[0], idr0 = g[0x20 / 4], idr1 = g[0x24 / 4];
++	uint32_t smrs = idr0 & 0xff, page = (idr1 >> 31) ? 0x10000 : 0x1000;
++	uint32_t pages = 1u << (((idr1 >> 28) & 7) + 1);
++	IOLog("SWEET SMMU: cr0 %#x idr0 %#x idr1 %#x (%u SMRs, unmatched %s)\n", cr0, idr0, idr1, smrs,
++	    (cr0 >> 10) & 1 ? "fault" : "bypass");
++	for (uint32_t i = 0; i < smrs && i < 128; i++) {
++		uint32_t smr = g[(0x800 + 4 * i) / 4], id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		if (!(smr >> 31) || ((stream ^ id) & ~mask) != 0) {
++			continue;
++		}
++		uint32_t s2cr = g[(0xc00 + 4 * i) / 4], type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
++		IOLog("SWEET SMMU: stream %#x: SMR[%u] %#x S2CR %#x (%s, cb %u)\n", stream, i, smr, s2cr,
++		    type == 0 ? "translate" : type == 1 ? "bypass" : "fault", cb);
++		if (type == 0 && (uint64_t)(pages + cb + 1) * page <= 0x80000) {
++			volatile uint32_t *c = g + (pages + cb) * page / 4;
++			IOLog("SWEET SMMU: cb %u: sctlr %#x tcr %#x ttbr0 %#x%08x fsr %#x far %#x%08x\n", cb,
++			    c[0], c[0x30 / 4], c[0x24 / 4], c[0x20 / 4], c[0x58 / 4], c[0x64 / 4], c[0x60 / 4]);
++		}
++	}
++}
++
+ bool
+ AppleCLCD::dsiDcsLong(const uint8_t *payload, uint32_t len)
+ {
+@@ -624,14 +675,33 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	if (fDsi == NULL || fDsiBuf == NULL || len > 60) {
+ 		return false;
+ 	}
+-	uint8_t *p = (uint8_t *)fDsiBuf->getBytesNoCopy();
++	uint8_t local[64];
++	uint8_t *p = fDsiSplash != NULL ? local : (uint8_t *)fDsiBuf->getBytesNoCopy();
+ 	uint32_t size = (4 + len + 3) & ~3u;
+ 	memset(p, 0xff, 64);
+ 	memcpy(p, hdr, 4);
+ 	if (len) {
+ 		memcpy(p + 4, payload, len);
+ 	}
+-	sweet_dcache_clean((vm_offset_t)(uintptr_t)p, 64);
++	uint64_t phys = fDsiBufPhys;
++	if (fDsiSplash != NULL) {
++		/* device memory: aligned 32-bit stores only */
++		for (uint32_t i = 0; i < 16; i++) {
++			uint32_t w;
++			memcpy(&w, local + 4 * i, 4);
++			fDsiSplash[i] = w;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		phys = fDsiSplashPhys;
++	} else {
++		sweet_dcache_clean((vm_offset_t)(uintptr_t)p, 64);
++	}
++	bool log = fDsiLogs < 4;
++	if (log) {
++		IOLog("SWEET FB: DSI before: hw %#x ctrl %#x status %#x dma_ctrl %#x trig %#x int %#x err %#x pkt %#llx [%02x %02x %02x %02x]\n",
++		    dsi_rd(fDsi, 0x000), dsi_rd(fDsi, 0x004), dsi_rd(fDsi, 0x008), dsi_rd(fDsi, 0x03c),
++		    dsi_rd(fDsi, 0x084), dsi_rd(fDsi, 0x110), dsi_rd(fDsi, 0x10c), phys, p[0], p[1], p[2], p[3]);
++	}
+ 	uint32_t ctrl = dsi_rd(fDsi, 0x004), trig = dsi_rd(fDsi, 0x084);
+ 	if ((trig & 7) != 4) {
+ 		dsi_wr(fDsi, 0x084, (trig & ~7u) | 4);  /* DMA trigger: software */
+@@ -639,7 +709,7 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	dsi_wr(fDsi, 0x004, ctrl | 4 | 1);              /* CMD_MODE_EN | DSI_EN */
+ 	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);   /* clear CMD_DMA_DONE */
+ 	dsi_wr(fDsi, 0x15c, 0);                          /* no test pattern */
+-	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
++	dsi_wr(fDsi, 0x048, (uint32_t)phys);
+ 	dsi_wr(fDsi, 0x04c, size);
+ 	uint32_t dma = dsi_rd(fDsi, 0x03c);
+ 	dsi_wr(fDsi, 0x03c, dma & ~(1u << 26));          /* high speed */
+@@ -657,6 +727,11 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	if (trig != dsi_rd(fDsi, 0x084)) {
+ 		dsi_wr(fDsi, 0x084, trig);
+ 	}
++	if (log) {
++		fDsiLogs++;
++		IOLog("SWEET FB: DSI after: done %d status %#x int %#x err %#x\n", done,
++		    dsi_rd(fDsi, 0x008), dsi_rd(fDsi, 0x110), dsi_rd(fDsi, 0x10c));
++	}
+ 	return done;
+ }
+ 
