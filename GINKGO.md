@@ -32,11 +32,12 @@ never in git or CI artifacts.
 | GPU power-up (steps 1-6) | ✅ | 0218: boot-arg `sweetgpu=1`, then `sysctl kern.sweetgpu=6`: CX and GX GDSCs on, 3D core at 19.2 MHz, RBBM_STATUS answers (0x1) |
 | GPU SMMU read, TrustZone, zap shader (steps 7-9) | ✅ | 0219/0220: `sysctl kern.sweetgpu=9`; firmware from the phone's vendor image via `mkpayload.py --gpufw` (not in git); TrustZone accepts the signature and starts the zap shader in gpu_region 0x57515000 |
 | GPU command processor (steps 10-12) | ✅ | 0221: `sysctl kern.sweetgpu=12`: SQE microcode, ring, GPU stream to SMMU context 4 untranslated, CP_ME_INIT, CP_SET_SECURE_MODE 0 (TRUST_CNTL 1 -> 0), CP_MEM_WRITE lands in our memory |
+| GPU 2D engine to the panel (steps 13-14) | ✅ | 0222: solid fill verified in memory, then three bands drawn into the boot framebuffer (0x5c000000) |
 | DYLD_* / inserted libraries | ✅ | 0217: the AMFI stand-in answers dyld's policy call |
 | USB networking | ✅ | 0214, boot-args `sweetusb=2 sweethw=1`; phone 192.168.7.2, live log udp/5140 |
 | SSH | ✅ | dropbear from `dropbear.yml` with `tools/dropbear/sweet_pw.c`: libinfo user lookups fail on the port, so OpenSSH rejects every user |
 | CPU cores | 4 | `cpus=4`: the 16K-page kernel runs on the A73 cores only (A53 has no 16K granule — verify) |
-| GPU (Adreno 610) | ❌ | software rendering; willow-hackios has power-up + Mesa freedreno |
+| GPU for the UI (Mesa) | ❌ | software rendering; next: willow's RedwoodGPU user client + SMMU page tables, then Mesa freedreno |
 | Wi-Fi, cellular, BT, audio, camera, sensors | ❌ | |
 
 ## Roadmap (in order)
