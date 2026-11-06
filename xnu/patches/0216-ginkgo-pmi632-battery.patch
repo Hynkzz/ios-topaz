@@ -1,0 +1,319 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 99e01b5..38e5a73 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -191,39 +191,70 @@ sweet_keys_init(void)
+ }
+ 
+ /*
+- * PM6125 RTC (USID 0, peripheral 0x60, pm6125.dtsi qcom,pm6125_rtc_rw@6000):
+- * a 32-bit seconds counter, RTC_CTRL 0x46 bit 7 = enabled, RTC_READ 0x48-0x4b
+- * least significant byte first (Linux qpnp-rtc.c). The dtsi has
+- * qcom,qpnp-rtc-write = <0>: the counter is never set, Android adds an
+- * offset it keeps in userspace. Read only, like the keys. Read twice so a
+- * carry between the byte reads is caught. Thread context; may be called
+- * before sweet_keys_init.
++ * Read-only PMIC access for other drivers, over the same SPMI observer
++ * channels as the keys. Only the peripherals below can be read:
++ *   USID 0 0x60  PM6125 RTC
++ *   USID 2 0x10  PMI632 charger (CHGR), 0x11 DCDC, 0x13 USBIN, 0x48 QG
++ * Thread context; may be called before sweet_keys_init.
+  */
++static const uint16_t pmic_ppids[] = { 0x060, 0x210, 0x211, 0x213, 0x248 };
++static uint16_t pmic_apids[sizeof(pmic_ppids) / sizeof(pmic_ppids[0])];
++static uint32_t pmic_count;
++
++int sweet_pmic_read(unsigned sid, unsigned addr, uint8_t *out);
++
+ int
+-sweet_rtc_read(uint32_t *secs)
++sweet_pmic_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	static uint16_t rtc_apid = KEYS_NO_APID;
+-	if (!keys_map()) {
++	unsigned ppid = (sid << 8) | ((addr >> 8) & 0xffu);
++	unsigned slot;
++	if (out == NULL || sid > 0xfu || addr > 0xffffu) {
++		return -1;
++	}
++	for (slot = 0; slot < sizeof(pmic_ppids) / sizeof(pmic_ppids[0]); slot++) {
++		if (pmic_ppids[slot] == ppid) {
++			break;
++		}
++	}
++	if (slot == sizeof(pmic_ppids) / sizeof(pmic_ppids[0]) || !keys_map()) {
+ 		return -1;
+ 	}
+-	if (rtc_apid == KEYS_NO_APID) {
++	if (pmic_count == 0) {
+ 		uint32_t version = keys_rd(keys_core, 0), count = keys_rd(keys_core, 4) & 0x7ffu;
+ 		if (version < 0x50000000u || version >= 0x70000000u || count == 0 || count > 512) {
+ 			return -1;
+ 		}
+-		rtc_apid = keys_find_apid(0x060, count);
++		for (unsigned i = 0; i < sizeof(pmic_ppids) / sizeof(pmic_ppids[0]); i++) {
++			pmic_apids[i] = keys_find_apid(pmic_ppids[i], count);
++		}
++		pmic_count = count;
+ 	}
++	return keys_read(pmic_apids[slot], (uint16_t)addr, out) ? 0 : -1;
++}
++
++/*
++ * PM6125 RTC (USID 0, peripheral 0x60, pm6125.dtsi qcom,pm6125_rtc_rw@6000):
++ * a 32-bit seconds counter, RTC_CTRL 0x46 bit 7 = enabled, RTC_READ 0x48-0x4b
++ * least significant byte first (Linux qpnp-rtc.c). The dtsi has
++ * qcom,qpnp-rtc-write = <0>: the counter is never set, Android adds an
++ * offset it keeps in userspace. Read twice so a carry between the byte
++ * reads is caught.
++ */
++int
++sweet_rtc_read(uint32_t *secs)
++{
+ 	uint8_t ctrl = 0;
+-	if (!keys_read(rtc_apid, 0x6046, &ctrl) || !(ctrl & 0x80u)) {
++	if (sweet_pmic_read(0, 0x6046, &ctrl) != 0 || !(ctrl & 0x80u)) {
+ 		return -1;
+ 	}
+ 	for (int attempt = 0; attempt < 3; attempt++) {
+ 		uint8_t b[4], again;
+-		bool ok = true;
+-		for (int i = 0; i < 4 && ok; i++) {
+-			ok = keys_read(rtc_apid, (uint16_t)(0x6048 + i), &b[i]);
++		for (int i = 0; i < 4; i++) {
++			if (sweet_pmic_read(0, 0x6048 + i, &b[i]) != 0) {
++				return -1;
++			}
+ 		}
+-		if (!ok || !keys_read(rtc_apid, 0x6048, &again)) {
++		if (sweet_pmic_read(0, 0x6048, &again) != 0) {
+ 			return -1;
+ 		}
+ 		if (again == b[0]) {
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 824c022..32d2797 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,6 +12,9 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++/* bsd/dev/sweet_keys.c: read-only PMIC access (ginkgo PMI632 on USID 2) */
++extern "C" int sweet_pmic_read(unsigned sid, unsigned addr, uint8_t *out);
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -30,14 +33,18 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fGinkgo;
+ 	int fLastMode;
++	unsigned fDesign;       /* mAh */
++	int fSmooth;            /* ginkgo: smoothed SOC in 1/100 %, -1 = none yet */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
+ 	bool pollTopaz(void);
++	bool pollGinkgo(void);
++	static bool readPmicWord(unsigned sid, unsigned address, uint16_t *value);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -56,7 +63,9 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fGinkgo = false;
++	fDesign = 5020;
++	fSmooth = -1;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -106,11 +115,11 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (DT nominal=5020; ginkgo 4000). powerd computes C*100/M. */
++	const unsigned capacity = (fDesign * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fDesign);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -124,8 +133,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fDesign);
++	putNumber("DesignCapacity", fDesign);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -142,7 +151,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fDesign, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -159,7 +168,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? (fGinkgo ? "PMI632 / estimated SOC" : "PM6150 / estimated SOC") : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -188,6 +197,26 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ 	return false;
+ }
+ 
++bool
++SweetBattery::readPmicWord(unsigned sid, unsigned address, uint16_t *value)
++{
++	uint16_t previous = 0;
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t lo, hi;
++		if (sweet_pmic_read(sid, address, &lo) ||
++		    sweet_pmic_read(sid, address + 1, &hi)) {
++			return false;
++		}
++		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++		if (attempt && next == previous) {
++			*value = next;
++			return true;
++		}
++		previous = next;
++	}
++	return false;
++}
++
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+@@ -257,9 +286,90 @@ SweetBattery::pollTopaz(void)
+ 	return true;
+ }
+ 
++/*
++ * ginkgo: PMI632 on USID 2 (pmi632.dtsi), the same QG/SMB5 register layout
++ * as the PM6150 path below: QG 0x4800 (LAST_ADC_V 0xc0, LAST_ADC_I 0xc2,
++ * qg-defs.h V_RAW_TO_UV 194.637 uV, I_RAW_TO_UA 152.588 uA for the 5 A
++ * subtype), CHGR status 0x1006/0x1007/0x100d, DCDC power path 0x110b,
++ * USBIN_INT_RT_STS 0x1310 bit 4. Read only. Android's QG computes SOC in
++ * software from a battery profile; here the voltage curve is used on an
++ * open-circuit estimate (ESR ~150 mOhm for the load), smoothed, and only
++ * allowed to fall on battery and rise on the charger.
++ */
++bool
++SweetBattery::pollGinkgo(void)
++{
++	uint8_t type, present, usb = 0, path = 0, charger = 0, error = 0, temperature = 0, subtype;
++	uint16_t rawVoltage, rawCurrent;
++	if (sweet_pmic_read(2, 0x4804, &type) || type != 0x0d ||
++	    sweet_pmic_read(2, 0x4808, &present) || !(present & 1u) ||
++	    !readPmicWord(2, 0x48c0, &rawVoltage) || rawVoltage == 0x8000) {
++		return false;
++	}
++	unsigned mv = (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u);
++	if (mv < 2800 || mv > 4600) {
++		return false;
++	}
++	bool chgOk = !sweet_pmic_read(2, 0x1310, &usb) &&
++	    !sweet_pmic_read(2, 0x110b, &path) &&
++	    !sweet_pmic_read(2, 0x1006, &charger) &&
++	    !sweet_pmic_read(2, 0x1007, &error) &&
++	    !sweet_pmic_read(2, 0x100d, &temperature);
++	bool external = chgOk && (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	bool charging = capable && state >= 1 && state <= 4 &&
++	    !(error & 2u) && !(temperature & 0x0cu);
++	bool full = external && state == 5 && !(error & 2u);
++	int ma = 0;
++	bool currentValid = !sweet_pmic_read(2, 0x4805, &subtype) &&
++	    (subtype == 3 || subtype == 4) && readPmicWord(2, 0x48c2, &rawCurrent) &&
++	    rawCurrent != 0x8000;
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
++		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
++		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
++	}
++	/* Open-circuit estimate: add back the drop under load, remove the rise while charging. */
++	int ocv = (int)mv - ma * 150 / 1000;
++	if (ocv < 2800) {
++		ocv = 2800;
++	} else if (ocv > 4600) {
++		ocv = 4600;
++	}
++	int raw = (int)estimatePercent((unsigned)ocv) * 100;
++	if (fSmooth < 0) {
++		fSmooth = raw;
++	} else {
++		int next = fSmooth + (raw - fSmooth) / 4;
++		if ((!external && next < fSmooth) || (external && next > fSmooth)) {
++			fSmooth = next;
++		}
++	}
++	unsigned percent = full ? 100u : (unsigned)((fSmooth + 50) / 100);
++	if (percent < 1) {
++		percent = 1;
++	} else if (percent > 100) {
++		percent = 100;
++	}
++	publish(percent, mv, ma, external, capable, charging, full, true, currentValid);
++	static unsigned logs;
++	if (logs++ % 30 == 0) {
++		IOLog("SWEET BATTERY: ginkgo %u%% %umV ocv %dmV %dmA usb=%#x path=%#x chg=%#x external=%d charging=%d\n",
++		    percent, mv, ocv, ma, usb, path, charger, external, charging);
++	}
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fReal && fGinkgo) {
++		if (!pollGinkgo()) {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
++		return;
++	}
+ 	if (fReal && pollTopaz()) {
+ 		return;
+ 	}
+@@ -324,9 +434,17 @@ SweetBattery::start(IOService *provider)
+ 		return false;
+ 	}
+ 	(void)sweet_cpufreq_max();
+-	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
++	int real = 1;   /* topaz, ginkgo: real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_i2c1_init() == 0;
++	/* ginkgo (eMMC ADT node): PMI632 over SPMI, no I2C gauge, 4000 mAh */
++	DTEntry node;
++	fGinkgo = SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) == kSuccess;
++	if (fGinkgo) {
++		fDesign = 4000;
++		fReal = real == 1;
++	} else {
++		fReal = real == 1 && sweet_i2c1_init() == 0;
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
