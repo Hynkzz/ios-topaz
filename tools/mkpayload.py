@@ -31,6 +31,13 @@ e.g. fw_huaxing_v09.bin, or NT36672A, e.g. novatek_ts_ebbg_fw.bin: the kernel
 picks the driver from the image's header): one more segment after the kernel/ramdisk and
 /chosen/memory-map "TouchFirmware" = <phys, exact byte size>. The image only
 goes into this payload; keep it out of git and out of CI artifacts.
+
+--gpufw DIR packs the GPU firmware files found in DIR (ginkgo: the phone's
+/vendor/firmware a610_zap.mdt, a610_zap.b00.., a630_sqe.fw) into one more
+segment, /chosen/memory-map "GPUFirmware" = <phys, size>: a "SWGPUFW1"
+header, a u32 count, then {char name[32], u32 offset, u32 size} per file;
+every file starts on a 16 KB boundary (TrustZone reads the .mdt header in
+place). Same rule: never in git or in CI artifacts.
 """
 import argparse, os, struct, sys
 
@@ -150,7 +157,25 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touchfw_path=None):
+GPUFW_NAMES = ('a610_zap.mdt', 'a610_zap.b00', 'a610_zap.b01', 'a610_zap.b02', 'a610_zap.b03',
+               'a610_zap.b04', 'a630_sqe.fw')
+
+
+def pack_gpufw(directory):
+    files = [(n, open(os.path.join(directory, n), 'rb').read())
+             for n in GPUFW_NAMES if os.path.isfile(os.path.join(directory, n))]
+    assert any(n == 'a610_zap.mdt' for n, _ in files), 'no a610_zap.mdt in ' + directory
+    blob = bytearray(PAGE)
+    struct.pack_into('<8sI', blob, 0, b'SWGPUFW1', len(files))
+    for i, (name, data) in enumerate(files):
+        assert len(name) < 32 and len(data) <= 0x40000
+        struct.pack_into('<32sII', blob, 12 + 40 * i, name.encode(), len(blob), len(data))
+        blob += data
+        blob += b'\0' * (-len(blob) & (PAGE - 1))
+    return bytes(blob)
+
+
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touchfw_path=None, gpufw_dir=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -189,6 +214,16 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touchfw_path=None):
         adt_blob = add_loader_info(adt_blob, 'TouchFirmware', fw_pa, len(image))
         touchfw = (hex(fw_pa), hex(len(image)))
 
+    gpufw = None
+    if gpufw_dir:
+        image = pack_gpufw(gpufw_dir)
+        gf_va = kernel_end
+        kernel_end = gf_va + len(image)
+        gf_pa = gf_va - virt_base + PHYS_BASE
+        pieces.append((gf_va, len(image), image))
+        adt_blob = add_loader_info(adt_blob, 'GPUFirmware', gf_pa, len(image))
+        gpufw = (hex(gf_pa), hex(len(image)))
+
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
     seg_table = []
@@ -209,7 +244,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touchfw_path=None):
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, touchfw=touchfw, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, touchfw=touchfw, gpufw=gpufw, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -220,8 +255,9 @@ if __name__ == '__main__':
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--touchfw', help='touch IC firmware image (ADT memory-map TouchFirmware)')
+    ap.add_argument('--gpufw', help='directory with the GPU firmware files (ADT memory-map GPUFirmware)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.touchfw)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.touchfw, a.gpufw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
