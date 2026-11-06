@@ -1,0 +1,222 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9c42e45..72fbb1e 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -39,28 +40,48 @@ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+-#define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
++#define DWC3_SIZE               0x0000d000
++#define QUSB2_SIZE              0x00000400
+ 
+-static const struct {
++/*
++ * Per SoC: sweet (SM7150, gcc-sdmmagpie.c) and ginkgo (SM6125 trinket,
++ * gcc-trinket.c; ssusb@4e00000, qusb@1613000, a QUSB2 v1 PHY). ginkgo is
++ * told apart by its /sweet-sdhci node (eMMC), as in sweet_ufs.c. The
++ * branch order is the same for both: master, sleep, utmi, cfg-noc-axi,
++ * aggre/sys-noc-axi, ahb2phy, clkref.
++ */
++struct usb_soc {
+ 	const char *name;
+-	uint32_t    off;
+-} usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	vm_offset_t gcc, dwc, qusb;
++	uint32_t    gdscr;
++	uint32_t    cbcr[7];
++	bool        qusb_v1;
++	uint32_t    stream;         /* apps SMMU stream of the controller (0: none known) */
++};
++static const struct usb_soc usb_sweet = {
++	"sm7150", 0x00100000, 0x0a600000, 0x088e2000, 0x0f004,
++	{ 0x0f010, 0x0f014, 0x0f018, 0x0502c, 0x8201c, 0x6a004, 0x8c010 }, false, 0,
++};
++static const struct usb_soc usb_trinket = {
++	"sm6125", 0x01400000, 0x04e00000, 0x01613000, 0x1a004,
++	{ 0x1a010, 0x1a014, 0x1a018, 0x1a084, 0x1a080, 0x1d008, 0x80278 }, true, 0x100,
++};
++static const char *const usb_cbcr_name[7] = {
++	"master", "sleep", "utmi", "cfg-noc-axi", "aggre-axi", "ahb2phy", "clkref",
+ };
++static const struct usb_soc *usb_soc;
+ 
+-#define DWC3_PA                 0x0a600000
+-#define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
++static const struct usb_soc *
++usb_soc_get(void)
++{
++	if (usb_soc == NULL) {
++		DTEntry node;
++		usb_soc = SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) == kSuccess ? &usb_trinket : &usb_sweet;
++	}
++	return usb_soc;
++}
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -70,11 +91,51 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * Read-only: what the apps SMMU (SMMUv2 at 0x0c600000 on sm6125) does with
++ * the controller's DMA stream -- the event buffer and every packet go
++ * through it. A translating context bank set up by ABL would turn our
++ * physical addresses into faults.
++ */
++static void
++usb_smmu_report(uint32_t stream)
++{
++	vm_offset_t g = ml_io_map(0x0c600000, 0x80000);
++	if (g == 0) {
++		return;
++	}
++	uint32_t cr0 = usb_rd(g, 0), idr0 = usb_rd(g, 0x20), idr1 = usb_rd(g, 0x24);
++	uint32_t smrs = idr0 & 0xff, page = (idr1 >> 31) ? 0x10000 : 0x1000;
++	uint32_t pages = 1u << (((idr1 >> 28) & 7) + 1);
++	bool found = false;
++	for (uint32_t i = 0; i < smrs && i < 128; i++) {
++		uint32_t smr = usb_rd(g, 0x800 + 4 * i), id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		if (!(smr >> 31) || ((stream ^ id) & ~mask) != 0) {
++			continue;
++		}
++		uint32_t s2cr = usb_rd(g, 0xc00 + 4 * i), type = (s2cr >> 16) & 3, cb = s2cr & 0xff;
++		found = true;
++		printf("SWEET USB: SMMU stream %#x: SMR[%u] %#x S2CR %#x (%s, cb %u)\n", stream, i, smr, s2cr,
++		    type == 0 ? "translate" : type == 1 ? "bypass" : "fault", cb);
++		if (type == 0 && (uint64_t)(pages + cb + 1) * page <= 0x80000) {
++			vm_offset_t c = g + (pages + cb) * page;
++			printf("SWEET USB: SMMU cb %u: sctlr %#x (%s) ttbr0 %#x%08x fsr %#x\n", cb,
++			    usb_rd(c, 0), (usb_rd(c, 0) & 1) ? "TRANSLATING" : "off", usb_rd(c, 0x24),
++			    usb_rd(c, 0x20), usb_rd(c, 0x58));
++		}
++	}
++	if (!found) {
++		printf("SWEET USB: SMMU stream %#x unmatched (cr0 %#x: %s)\n", stream, cr0,
++		    (cr0 >> 10) & 1 ? "fault" : "bypass");
++	}
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+ 	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
++	const struct usb_soc *soc = usb_soc_get();
++	uint32_t gdscr, cbcr[7];
+ 	bool clocks_on = true;
+ 
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+@@ -82,16 +143,17 @@ sweet_usb_probe(void)
+ 	if (!enabled) {
+ 		return;
+ 	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	printf("SWEET USB: %s: GCC %#lx DWC3 %#lx QUSB2 %#lx\n", soc->name, soc->gcc, soc->dwc, soc->qusb);
++	vm_offset_t gcc = ml_io_map(soc->gcc, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	gdscr = usb_rd(gcc, soc->gdscr);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
++	for (unsigned i = 0; i < 7; i++) {
++		cbcr[i] = usb_rd(gcc, soc->cbcr[i]);
++		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr_name[i], cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+@@ -100,7 +162,10 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+ 	}
+-	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (soc->stream) {
++		usb_smmu_report(soc->stream);
++	}
++	vm_offset_t dwc = ml_io_map(soc->dwc, DWC3_SIZE);
+ 	if (dwc == 0) {
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+@@ -120,10 +185,16 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+ 	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t phy = ml_io_map(soc->qusb, QUSB2_SIZE);
+ 	if (phy == 0) {
+ 		return;
+ 	}
++	if (soc->qusb_v1) {
++		/* phy-msm-qusb.c (v1): PLL_STATUS 0x38 (bit 5 lock), TUNE2 0x84, POWERDOWN 0xb4 */
++		printf("SWEET USB: QUSB2 v1 PLL_STATUS 0x%08x TUNE2 0x%08x POWERDOWN 0x%08x\n",
++		    usb_rd(phy, 0x38), usb_rd(phy, 0x84), usb_rd(phy, 0xb4));
++		return;
++	}
+ 	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+ 	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+ 	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+@@ -164,7 +235,7 @@ sweet_usb_probe(void)
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_OFF            0xf8800
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+@@ -866,7 +937,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	vm_offset_t qs = ml_io_map(usb_soc_get()->dwc + QSCRATCH_OFF, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2bb0139..2381546 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -319,12 +319,11 @@ AppleCLCD::start(IOService *provider)
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+ 	/*
+-	 * ginkgo (2340-line panel): the NT36672A takes 0x51 with one byte, as its
+-	 * own on-command (51 b8) and HBM commands (51 cc/e6/ff) in the Xiaomi
+-	 * dtsi; the topaz two-byte write would leave it at the first byte, 0x01.
+-	 * sweetbl_dbv=8 or 11 overrides.
++	 * Panel DBV: two bytes, MSB first, for topaz and ginkgo alike (on the
++	 * NT36672A 51 00 01 is near black, a one-byte 51 28 is ignored).
++	 * sweetbl_dbv=8 sends one byte instead.
+ 	 */
+-	uint32_t dbv = fHeight == 2340 ? 8 : 11;
++	uint32_t dbv = 11;
+ 	(void)PE_parse_boot_argn("sweetbl_dbv", &dbv, sizeof(dbv));
+ 	fBl8 = dbv == 8;
+ 	fBlMax = fBl8 ? 0xff : 0x7ff;
