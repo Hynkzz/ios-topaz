@@ -1,0 +1,193 @@
+diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
+index 5a787de..b0a19bb 100644
+--- a/bsd/dev/sweet_a610.c
++++ b/bsd/dev/sweet_a610.c
+@@ -20,12 +20,19 @@
+  *   4  writes  the bus clocks on, CX's GDSC on, the CX clocks on
+  *   5  writes  GX's GDSC on, the 3D core's clock from the 19.2 MHz crystal
+  *   6  reads   the first registers of the GPU block (RBBM_STATUS)
++ *   7  reads   the GPU's SMMU (0x59a0000) as the firmware and the hypervisor
++ *              left it: ID registers, stream matches, contexts
++ *   8  asks    TrustZone what Linux asks first, with calls that pass no
++ *              memory: whether it takes SCM calls, whether it has PAS_INIT_IMAGE
++ *              and PAS_AUTH_AND_RESET, which PAS images (13: the zap shader) it
++ *              supports
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
++#include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <sys/errno.h>
+@@ -43,6 +50,21 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define GPU_SIZE                0x90000UL
+ #define QFPROM_PHYS             0x01b40000UL
+ #define QFPROM_SIZE             0x7000UL
++#define SMMU_PHYS               0x059a0000UL
++#define SMMU_SIZE               0x10000UL
++
++/* SMCCC SiP calls the way Linux's qcom_scm-smc.c makes them */
++#define SCM_FAST                (1ull << 31)
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(service, command) ((uint64_t)(service) << 8 | (command))
++#define SCM_IS_CALL_AVAILABLE   SCM_CALL(6, 1)
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
++#define SCM_ONE_VALUE           1
++#define SCM_INTERRUPTED         1
++#define PAS_GPU                 13
+ 
+ #define CLOCK_OFF               (1u << 31)      /* branch control: the clock does not run */
+ #define CLOCK_ENABLE            (1u << 0)
+@@ -52,7 +74,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define GDSC_CX                 0x106c
+ #define GDSC_GX                 0x100c
+ 
+-static vm_offset_t gcc, gpucc, gpu, qfprom;
++static vm_offset_t gcc, gpucc, gpu, qfprom, smmu;
+ static int a610_done;
+ static LCK_GRP_DECLARE(a610_grp, "sweet_a610");
+ static LCK_MTX_DECLARE(a610_lock, &a610_grp);
+@@ -112,6 +134,41 @@ gdsc_state(const char *name, uint32_t offset)
+ 	return (value & GDSC_ON) != 0;
+ }
+ 
++/*
++ * One SCM call with one value. A call TrustZone does not finish at once
++ * comes back "interrupted" and is resumed with the session it gave back in
++ * x6 (ARM_SMCCC_QUIRK_QCOM_A6), for up to 5 s. Returns x0, the answer in x1.
++ */
++static int32_t
++scm(const char *what, uint64_t function, uint64_t first, uint64_t *answer)
++{
++	uint64_t session = 0, deadline;
++
++	printf("SWEET A610: asking TrustZone %s: smc %#llx (%#llx)\n", what, function, first);
++	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
++	for (uint64_t i = 0; i == 0 || mach_absolute_time() < deadline; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = SCM_ONE_VALUE;
++		register uint64_t x2 __asm__("x2") = first;
++		register uint64_t x3 __asm__("x3") = 0;
++		register uint64_t x4 __asm__("x4") = 0;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			printf("SWEET A610: TrustZone returns %d, answer %#llx (%llu resumptions)\n", (int32_t)x0, x1, i);
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	printf("SWEET A610: TrustZone still says interrupted after 5 s\n");
++	return -1;
++}
++
+ struct named {
+ 	const char *name;
+ 	uint32_t    offset;
+@@ -244,7 +301,85 @@ a610_run(int steps)
+ 	/* words: RBBM_STATUS 0x210, RBBM_STATUS3 0x213, CP_SQE_INSTR_BASE 0x830 */
+ 	printf("SWEET A610: RBBM_STATUS %#x RBBM_STATUS3 %#x CP_SQE_INSTR_BASE %#x:%#x\n",
+ 	    rd(gpu + 4 * 0x210), rd(gpu + 4 * 0x213), rd(gpu + 4 * 0x830), rd(gpu + 4 * 0x831));
+-	return 6;
++	if (steps < 7) {
++		return 6;
++	}
++
++	printf("SWEET A610: step 7: GPU SMMU (%#lx)\n", SMMU_PHYS);
++	if (smmu == 0) {
++		smmu = ml_io_map(SMMU_PHYS, SMMU_SIZE);
++	}
++	{
++		/* SMMUv2: IDR0[7:0] stream matches; IDR1[31] 64K pages, [30:28] log2 pages - 1, [7:0] contexts */
++		uint32_t idr0 = rd(smmu + 0x20), idr1 = rd(smmu + 0x24), page = idr1 >> 31 ? 0x10000 : 0x1000;
++		uint32_t pages = 2u << (idr1 >> 28 & 7), contexts = idr1 & 0xff, matches = idr0 & 0xff;
++
++		printf("SWEET A610: SMMU sCR0 %#x IDR0 %#x IDR1 %#x IDR2 %#x IDR7 %#x sGFSR %#x\n", rd(smmu + 0x0), idr0, idr1,
++		    rd(smmu + 0x28), rd(smmu + 0x3c), rd(smmu + 0x48));
++		printf("SWEET A610: SMMU %u stream matches, %u contexts, %u pages of %#x\n", matches, contexts, pages, page);
++		if (2 * pages * page != SMMU_SIZE) {
++			printf("SWEET A610: SMMU size %#x, expected %#lx: not reading further\n", 2 * pages * page, SMMU_SIZE);
++			return -7;
++		}
++		for (uint32_t i = 0; i < matches && i < 16; i++) {
++			uint32_t s2cr = rd(smmu + 0xc00 + 4 * i);
++
++			printf("SWEET A610: SMMU stream %u SMR %#x S2CR %#x (%s)\n", i, rd(smmu + 0x800 + 4 * i), s2cr,
++			    (s2cr >> 16 & 3) == 0 ? "translate" : (s2cr >> 16 & 3) == 1 ? "bypass" : "fault");
++		}
++		for (uint32_t i = 0; i < contexts && i < 16; i++) {
++			printf("SWEET A610: SMMU context %u CBAR %#x\n", i, rd(smmu + page + 4 * i));
++		}
++		{
++			vm_offset_t cb0 = smmu + pages * page;
++
++			printf("SWEET A610: SMMU context 0 SCTLR %#x TTBR0 %#x:%#x TCR %#x FSR %#x\n", rd(cb0 + 0x00),
++			    rd(cb0 + 0x24), rd(cb0 + 0x20), rd(cb0 + 0x30), rd(cb0 + 0x58));
++		}
++	}
++	if (steps < 8) {
++		return 7;
++	}
++
++	printf("SWEET A610: step 8: TrustZone questions that pass no memory\n");
++	{
++		uint64_t answer = 0, how = SCM_FAST | SCM_64 | SCM_SIP;
++		uint32_t supported = 0;
++		char list[96];
++		unsigned n = 0;
++
++		if (scm("whether it takes calls", how | SCM_IS_CALL_AVAILABLE, SCM_SIP | SCM_IS_CALL_AVAILABLE, &answer) != 0 ||
++		    answer != 1) {
++			how = SCM_FAST | SCM_SIP;
++			if (scm("the same, 32-bit", how | SCM_IS_CALL_AVAILABLE, SCM_SIP | SCM_IS_CALL_AVAILABLE, &answer) != 0 ||
++			    answer != 1) {
++				printf("SWEET A610: TrustZone does not answer as it answers Linux\n");
++				return -8;
++			}
++		}
++		(void)scm("for PAS_INIT_IMAGE", how | SCM_IS_CALL_AVAILABLE, SCM_SIP | SCM_PAS_INIT_IMAGE, &answer);
++		(void)scm("for PAS_AUTH_AND_RESET", how | SCM_IS_CALL_AVAILABLE, SCM_SIP | SCM_PAS_AUTH_AND_RESET, &answer);
++		answer = 0;
++		if (scm("whether it supports the zap shader", how | SCM_PAS_IS_SUPPORTED, PAS_GPU, &answer) == 0 && answer) {
++			supported = 1;
++		}
++		answer = 0;
++		if (scm("the same, preemptible", (how & ~SCM_FAST) | SCM_PAS_IS_SUPPORTED, PAS_GPU, &answer) == 0 && answer) {
++			supported |= 2;
++		}
++		printf("SWEET A610: TrustZone %s the zap shader (%u)\n", supported ? "lists" : "does not list", supported);
++		/* a "no" for 13 means something only if it says yes to others */
++		list[0] = 0;
++		for (uint64_t id = 0; id < 25; id++) {
++			answer = 0;
++			if (scm("whether it supports image", (how & ~SCM_FAST) | SCM_PAS_IS_SUPPORTED, id, &answer) == 0 && answer &&
++			    n + 4 < sizeof(list)) {
++				n += (unsigned)snprintf(list + n, sizeof(list) - n, " %llu", id);
++			}
++		}
++		printf("SWEET A610: TrustZone supports images:%s\n", n ? list : " none");
++	}
++	return 8;
+ }
+ 
+ static int
+@@ -262,7 +397,7 @@ sysctl_sweetgpu SYSCTL_HANDLER_ARGS
+ 	    SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) != kSuccess) {
+ 		return EPERM;   /* ginkgo only, and only with boot-arg sweetgpu=1 */
+ 	}
+-	if (value < 1 || value > 6) {
++	if (value < 1 || value > 8) {
+ 		return EINVAL;
+ 	}
+ 	lck_mtx_lock(&a610_lock);
