@@ -28,7 +28,8 @@ never in git or CI artifacts.
 | microSD root | ❌ | 0208: card stops after ACMD41/CMD2; log int status before line reset |
 | Brightness (boot-arg) | ✅ | `sweetbl_level=N` (DCS 0x51, two bytes MSB first); iOS slider ❌ |
 | RTC / date | ✅ | 0215: PM6125 RTC (read only) + boot-arg `sweetrtc_off` (per phone: set the time once over ssh, the log prints the value); also ends IOKit's 30 s IORTC wait |
-| Battery % | ❌ | PMI632 QG fuel gauge |
+| Battery % | ⚠️ | 0216: PMI632 QG voltage/current + charger state (read only), SOC estimated from voltage; the charger stays paused under iOS (no charging) |
+| DYLD_* / inserted libraries | ✅ | 0217: the AMFI stand-in answers dyld's policy call |
 | USB networking | ✅ | 0214, boot-args `sweetusb=2 sweethw=1`; phone 192.168.7.2, live log udp/5140 |
 | SSH | ✅ | dropbear from `dropbear.yml` with `tools/dropbear/sweet_pw.c`: libinfo user lookups fail on the port, so OpenSSH rejects every user |
 | CPU cores | 4 | `cpus=4`: the 16K-page kernel runs on the A73 cores only (A53 has no 16K granule — verify) |
