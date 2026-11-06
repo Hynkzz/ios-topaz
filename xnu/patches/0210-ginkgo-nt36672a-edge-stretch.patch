@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 42bb82c..a7b98d7 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1445,6 +1445,31 @@ nvt_identify(void)
+ 	return ENODEV;
+ }
+ 
++/*
++ * Panel pixel -> SweetHID's 1125x2436 canvas, where the 1080x2340 panel sits at
++ * +20,+48: 1:1 inside, but the outer NVT_EDGE pixels stretched onto the canvas
++ * border, so a swipe from the glass edge starts at iOS's screen edge (home
++ * indicator, Control Center, back swipe) instead of 48 px inside it.
++ */
++#define NVT_EDGE          48u
++#define NVT_CANVAS_W      1125u
++#define NVT_CANVAS_H      2436u
++#define NVT_OFF_X         20u     /* SweetHID fOffX: (1125 - 1080) / 2 & ~3 */
++#define NVT_OFF_Y         18u     /* SweetHID fOffY: (2436 - 2400) / 2 */
++
++static uint32_t
++nvt_edge(uint32_t v, uint32_t n, uint32_t off, uint32_t canvas)
++{
++	if (v < NVT_EDGE) {
++		return v * (off + NVT_EDGE) / NVT_EDGE;
++	}
++	if (v > n - 1u - NVT_EDGE) {
++		uint32_t from = n - 1u - NVT_EDGE + off, to = canvas - 1u;
++		return from + (v - (n - 1u - NVT_EDGE)) * (to - from) / NVT_EDGE;
++	}
++	return v + off;
++}
++
+ static int
+ touch_nvt_frame(void)
+ {
+@@ -1469,9 +1494,13 @@ touch_nvt_frame(void)
+ 		}
+ 		id--;
+ 		mask |= 1u << id;
+-		/* chip range -> 1080x2340 panel pixels, + 30 into SweetHID's canvas (touch_ft8719) */
+-		x[id] = (int)(px * (FT_PANEL_W - 1u) / nvt_max_x);
+-		y[id] = (int)(py * (FT_PANEL_H - 1u) / nvt_max_y) + 30;
++		/* chip range -> panel pixels -> canvas, less SweetHID's own offsets */
++		uint32_t cx = nvt_edge(px * (FT_PANEL_W - 1u) / nvt_max_x, FT_PANEL_W,
++		    (NVT_CANVAS_W - FT_PANEL_W) / 2u & ~3u, NVT_CANVAS_W);
++		uint32_t cy = nvt_edge(py * (FT_PANEL_H - 1u) / nvt_max_y, FT_PANEL_H,
++		    (NVT_CANVAS_H - FT_PANEL_H) / 2u, NVT_CANVAS_H);
++		x[id] = (int)cx - (int)NVT_OFF_X;
++		y[id] = (int)cy - (int)NVT_OFF_Y;
+ 		if (!(st.active & (1u << id)) && nvt_logged < 20) {
+ 			nvt_logged++;
+ 			printf("SWEET TOUCH: finger %u down raw %u,%u -> %d,%d\n", id, px, py, x[id], y[id]);
