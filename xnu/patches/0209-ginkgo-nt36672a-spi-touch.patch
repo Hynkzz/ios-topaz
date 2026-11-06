@@ -1,0 +1,476 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 3d9f611..42bb82c 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1017,7 +1017,7 @@ ft_fw_load(void)
+ }
+ 
+ static bool
+-spi_se_init(void)
++spi_se_init(bool mode1)
+ {
+ 	uint32_t rx = touch_rd(st.se, SE_HW_RX);
+ 	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+@@ -1038,7 +1038,7 @@ spi_se_init(void)
+ 	touch_wr(st.se, SE_MCLK, (4u << 4) | 1u);        /* 19.2 MHz / 4 = 4.8 MHz */
+ 	touch_wr(st.se, SPI_LOOPBACK, 0);
+ 	touch_wr(st.se, SPI_DEMUX_SEL, 0);               /* CS0 */
+-	touch_wr(st.se, SPI_CPHA, 1);                    /* SPI_MODE_1 */
++	touch_wr(st.se, SPI_CPHA, mode1 ? 1u : 0u);      /* FT8719 SPI_MODE_1, NT36672A mode 0 */
+ 	touch_wr(st.se, SPI_CPOL, 0);
+ 	touch_wr(st.se, SPI_DEMUX_INV, 0);
+ 	touch_wr(st.se, SPI_DELAYS, 0);
+@@ -1110,13 +1110,440 @@ touch_ft8719(void)
+ 	return 0;
+ }
+ 
++/*
++ * ginkgo's other panel: Novatek NT36672A TDDI (Shenchao/Tianma/EBBG) on the
++ * same SE2 SPI bus, reset GPIO87, IRQ GPIO88, but SPI mode 0 and no flash:
++ * the host loads its firmware into the chip's SRAM on every boot (Android:
++ * /vendor/firmware/novatek_ts_*_fw.bin; here mkpayload.py --touchfw).
++ * Chosen when the payload's TouchFirmware has a Novatek header, so no FTS
++ * packet (which would be a memory write to this chip) is ever sent.
++ *
++ * Protocol (Xiaomi ginkgo-q-oss nt36xxx_spi_c3j, nt36xxx_mem_map.h NT36672A):
++ *   page:  ff <addr[22:15]> <addr[14:7]>   selects a 128-byte window
++ *   write: 80|addr[6:0] data..             (counts on past the window)
++ *   read:  addr[6:0] dummy                 -> data from the third byte
++ * Report: 65 bytes at 0x21c00, 6 a finger: id<<3|status, x[11:4], y[11:4],
++ * x[3:0]<<4|y[3:0]; ids from 1, status 1/2 = down. Firmware facts at 0x21c78.
++ * Sequence cross-checked with Floppikrob/willow-hackios (8T, same chip).
++ */
++#define TOUCH_NVT         3
++#define NVT_PIN_RESET     87u
++#define NVT_EVENT         0x21c00u
++#define NVT_HOST_CMD      (NVT_EVENT + 0x50u)
++#define NVT_RESET_STATE   (NVT_EVENT + 0x60u)
++#define NVT_FWINFO        (NVT_EVENT + 0x78u)
++#define NVT_ENG_RST       0x7fff80u
++#define NVT_SWRST_N8      0x3f0feu
++#define NVT_SPI_RD_FAST   0x3f310u
++#define NVT_TRIM_ID       0x1f64eu
++#define NVT_ILM_CHECKSUM  0x3f100u
++#define NVT_DLM_CHECKSUM  0x3f104u
++#define NVT_BOOT_RDY      0x3f10du
++#define NVT_ILM_LENGTH    0x3f118u
++#define NVT_ILM_DES       0x3f128u
++#define NVT_DLM_DES       0x3f12cu
++#define NVT_DLM_LENGTH    0x3f130u
++#define NVT_BLD_CRC_EN    0x3f30eu
++#define NVT_VER_OFF       0x1a000u
++#define NVT_WRITE_MAX     1024u
++#define NVT_READ_MAX      128u
++#define NVT_REPORT        65u
++#define NVT_PARTS         32u
++
++struct nvt_part {
++	uint32_t bin, sram, size, crc;
++};
++
++static uint8_t nvt_tx[NVT_WRITE_MAX + 2u], nvt_rx[NVT_WRITE_MAX + 2u];
++static uint32_t nvt_max_x = FT_PANEL_W, nvt_max_y = FT_PANEL_H;
++static unsigned nvt_logged;
++
++/* One chip-select assertion for the whole buffer, in FIFO-sized fragments. */
++static int
++nvt_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	int err = 0;
++	for (unsigned off = 0; off < len && !err; off += SPI_CHUNK) {
++		unsigned n = len - off < SPI_CHUNK ? len - off : SPI_CHUNK;
++		err = spi_chunk(tx + off, rx ? rx + off : NULL, n, off + n < len);
++	}
++	return err;
++}
++
++static int
++nvt_page(uint32_t addr)
++{
++	const uint8_t tx[3] = {0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7)};
++	return nvt_xfer(tx, NULL, sizeof(tx));
++}
++
++/* Write from addr on, in the page already selected. */
++static int
++nvt_write_here(uint32_t addr, const uint8_t *data, unsigned len)
++{
++	if (len > NVT_WRITE_MAX) {
++		return EINVAL;
++	}
++	nvt_tx[0] = 0x80u | (uint8_t)(addr & 0x7fu);
++	memcpy(nvt_tx + 1, data, len);
++	return nvt_xfer(nvt_tx, NULL, len + 1u);
++}
++
++static int
++nvt_write_byte(uint32_t addr, uint8_t value)
++{
++	int err = nvt_page(addr);
++	return err ? err : nvt_write_here(addr, &value, 1);
++}
++
++static int
++nvt_read(uint32_t addr, uint8_t *out, unsigned len)
++{
++	if (len > NVT_READ_MAX) {
++		return EINVAL;
++	}
++	int err = nvt_page(addr);
++	if (err) {
++		return err;
++	}
++	memset(nvt_tx, 0, len + 2u);
++	nvt_tx[0] = (uint8_t)(addr & 0x7fu);
++	err = nvt_xfer(nvt_tx, nvt_rx, len + 2u);
++	if (!err) {
++		memcpy(out, nvt_rx + 2, len);
++	}
++	return err;
++}
++
++static uint32_t
++nvt_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* The payload's TouchFirmware if it is a Novatek image (version, ~version at 0x1a000). */
++static const uint8_t *
++nvt_firmware(uint32_t *size)
++{
++	void *pa = NULL;
++	int n = 0;
++	if (IODTGetLoaderInfo("TouchFirmware", &pa, &n) != 0 || pa == NULL || n <= 0) {
++		return NULL;
++	}
++	const uint8_t *fw = (const uint8_t *)ml_static_ptovirt((vm_offset_t)pa);
++	if (fw == NULL || (uint32_t)n < NVT_VER_OFF + 2u ||
++	    (uint8_t)(fw[NVT_VER_OFF] + fw[NVT_VER_OFF + 1u]) != 0xffu) {
++		return NULL;
++	}
++	*size = (uint32_t)n;
++	return fw;
++}
++
++/* Boot loader reset: the touch MCU restarts in its boot loader, ready for a download. */
++static void
++nvt_bootloader_reset(void)
++{
++	(void)nvt_write_byte(NVT_SWRST_N8, 0x69);
++	touch_wait(5);
++	(void)nvt_write_byte(NVT_SPI_RD_FAST, 0);
++}
++
++/* nt36xxx_mem_map.h trim_id_table rows for NT36672A: id[0], id[3], id[4], id[5]. */
++static const uint8_t nvt_trim[][4] = {
++	{0x0b, 0x72, 0x66, 0x03}, {0x0b, 0x82, 0x66, 0x03}, {0x0b, 0x25, 0x65, 0x03},
++	{0x0a, 0x72, 0x65, 0x03}, {0x0a, 0x72, 0x66, 0x03}, {0x0a, 0x82, 0x66, 0x03},
++	{0x0a, 0x70, 0x66, 0x03},
++};
++
++static bool
++nvt_check_chip(void)
++{
++	for (unsigned attempt = 0; attempt < 5 && !st.dead; ++attempt) {
++		uint8_t id[6] = {0};
++		nvt_bootloader_reset();
++		int err = nvt_read(NVT_TRIM_ID, id, sizeof(id));
++		printf("SWEET TOUCH: NT36672A trim id err=%d %02x %02x %02x %02x %02x %02x\n",
++		    err, id[0], id[1], id[2], id[3], id[4], id[5]);
++		for (unsigned i = 0; !err && i < sizeof(nvt_trim) / sizeof(nvt_trim[0]); ++i) {
++			if (id[0] == nvt_trim[i][0] && id[3] == nvt_trim[i][1] &&
++			    id[4] == nvt_trim[i][2] && id[5] == nvt_trim[i][3]) {
++				return true;
++			}
++		}
++		touch_wait(10);
++	}
++	return false;
++}
++
++/*
++ * Partition table of the firmware file (nvt_bin_header_parser): ILM and DLM
++ * first (BIN address, SRAM address, size; CRCs at 0x18), then the info
++ * sections from 0x30 and the overlays listed at the start of the DLM (SRAM
++ * address, size, BIN address, CRC each).
++ */
++static int
++nvt_parts(const uint8_t *fw, uint32_t fsize, struct nvt_part *p, unsigned *np)
++{
++	uint32_t hdr = nvt_le32(fw);
++	uint32_t info = hdr > 0x30u ? (hdr - 0x30u + 15u) / 16u : 0;
++	uint32_t ovl = (fw[0x28] & 0x10u) ? (fw[0x28] & 0x0fu) : 0;
++	unsigned n = 0;
++	if (2u + info + ovl > NVT_PARTS) {
++		return EINVAL;
++	}
++	for (unsigned i = 0; i < 2; ++i, ++n) {
++		p[n].bin = nvt_le32(fw + 12u * i);
++		p[n].sram = nvt_le32(fw + 4u + 12u * i);
++		p[n].size = nvt_le32(fw + 8u + 12u * i);
++		p[n].crc = nvt_le32(fw + 0x18u + 4u * i);
++	}
++	for (unsigned i = 0; i < info + ovl; ++i, ++n) {
++		uint64_t off = i < info ? 0x30u + 16u * i : (uint64_t)p[1].bin + 16u * (i - info);
++		if (off + 16u > fsize) {
++			return EINVAL;
++		}
++		const uint8_t *h = fw + off;
++		p[n].sram = nvt_le32(h);
++		p[n].size = nvt_le32(h + 4);
++		p[n].bin = nvt_le32(h + 8);
++		p[n].crc = nvt_le32(h + 12);
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		if ((uint64_t)p[i].bin + p[i].size + 1u > fsize) {
++			return EINVAL;
++		}
++	}
++	*np = n;
++	return 0;
++}
++
++/* Boot loader CRC registers of one bank: SRAM destination, length, checksum (same page). */
++static int
++nvt_crc_bank(uint32_t des, uint32_t sram, uint32_t len_at, uint32_t size, uint32_t sum_at, uint32_t crc)
++{
++	const uint8_t d[3] = {(uint8_t)sram, (uint8_t)(sram >> 8), (uint8_t)(sram >> 16)};
++	const uint8_t l[2] = {(uint8_t)size, (uint8_t)(size >> 8)};
++	const uint8_t c[4] = {(uint8_t)crc, (uint8_t)(crc >> 8), (uint8_t)(crc >> 16), (uint8_t)(crc >> 24)};
++	int err = nvt_page(des);
++	if (!err) {
++		err = nvt_write_here(des, d, sizeof(d));
++	}
++	if (!err) {
++		err = nvt_write_here(len_at, l, sizeof(l));
++	}
++	if (!err) {
++		err = nvt_write_here(sum_at, c, sizeof(c));
++	}
++	return err;
++}
++
++/*
++ * nvt_download_firmware_hw_crc: boot loader reset, every partition written
++ * (size + 1 bytes, as the vendor driver does), the ILM/DLM checksums handed
++ * to the boot loader with its CRC check on, the firmware's own CRC check
++ * (reset state cleared, host command 0xae), boot ready; then the reset state
++ * must reach 0xa0..0xaf.
++ */
++static int
++nvt_download(const uint8_t *fw, uint32_t fsize)
++{
++	struct nvt_part part[NVT_PARTS];
++	unsigned n = 0;
++	int err = nvt_parts(fw, fsize, part, &n);
++	if (err) {
++		printf("SWEET TOUCH: NT36672A firmware header not understood (%u bytes)\n", fsize);
++		return err;
++	}
++	printf("SWEET TOUCH: NT36672A firmware v%u, %u partitions, ILM %u at %#x, DLM %u at %#x\n",
++	    fw[NVT_VER_OFF], n, part[0].size, part[0].sram, part[1].size, part[1].sram);
++	for (unsigned attempt = 1; attempt <= 3 && !st.dead; ++attempt) {
++		uint32_t written = 0;
++		uint8_t s = 0;
++		nvt_bootloader_reset();
++		err = 0;
++		for (unsigned i = 0; i < n && !err; ++i) {
++			uint32_t left = part[i].size ? part[i].size + 1u : 0;
++			uint32_t sram = part[i].sram, bin = part[i].bin;
++			while (left && !err) {
++				uint32_t k = left < NVT_WRITE_MAX ? left : NVT_WRITE_MAX;
++				err = nvt_page(sram);
++				if (!err) {
++					err = nvt_write_here(sram, fw + bin, k);
++				}
++				sram += k;
++				bin += k;
++				left -= k;
++				written += k;
++			}
++		}
++		if (!err) {
++			err = nvt_crc_bank(NVT_ILM_DES, part[0].sram, NVT_ILM_LENGTH, part[0].size,
++			    NVT_ILM_CHECKSUM, part[0].crc);
++		}
++		if (!err) {
++			err = nvt_crc_bank(NVT_DLM_DES, part[1].sram, NVT_DLM_LENGTH, part[1].size,
++			    NVT_DLM_CHECKSUM, part[1].crc);
++		}
++		if (!err) {
++			err = nvt_read(NVT_BLD_CRC_EN, &s, 1);
++		}
++		if (!err) {
++			err = nvt_write_byte(NVT_BLD_CRC_EN, s | 0x80u);
++		}
++		if (!err) {
++			err = nvt_write_byte(NVT_RESET_STATE, 0);
++		}
++		if (!err) {
++			err = nvt_write_byte(NVT_HOST_CMD, 0xae);
++		}
++		if (!err) {
++			err = nvt_write_byte(NVT_BOOT_RDY, 1);
++		}
++		if (err) {
++			printf("SWEET TOUCH: NT36672A download %u: SPI err=%d after %u bytes\n",
++			    attempt, err, written);
++			continue;
++		}
++		touch_wait(5);
++		for (unsigned i = 0; i < 20; ++i) {
++			if (nvt_read(NVT_RESET_STATE, &s, 1) == 0 && s >= 0xa0u && s <= 0xafu) {
++				printf("SWEET TOUCH: NT36672A firmware running (download %u, %u bytes, state %#x)\n",
++				    attempt, written, s);
++				return 0;
++			}
++			touch_wait(10);
++		}
++		printf("SWEET TOUCH: NT36672A download %u: firmware did not start, state %#x\n", attempt, s);
++		err = ETIMEDOUT;
++	}
++	return err;
++}
++
++/* Firmware version and coordinate range; ENODEV if the version check fails. */
++static int
++nvt_identify(void)
++{
++	for (unsigned attempt = 0; attempt < 5; ++attempt) {
++		uint8_t f[16] = {0};
++		int err = nvt_read(NVT_FWINFO, f, sizeof(f));
++		if (err) {
++			return err;
++		}
++		if ((uint8_t)(f[0] + f[1]) == 0xffu) {
++			uint32_t x = ((uint32_t)f[4] << 8) | f[5], y = ((uint32_t)f[6] << 8) | f[7];
++			printf("SWEET TOUCH: NT36672A fw %u, %ux%u lines, range %ux%u\n", f[0], f[2], f[3], x, y);
++			if (x >= 100 && x <= 8192 && y >= 100 && y <= 8192) {
++				nvt_max_x = x;
++				nvt_max_y = y;
++			}
++			return 0;
++		}
++		printf("SWEET TOUCH: NT36672A fw info %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
++		touch_wait(20);
++	}
++	return ENODEV;
++}
++
++static int
++touch_nvt_frame(void)
++{
++	uint8_t r[NVT_REPORT];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	int err = nvt_read(NVT_EVENT, r, sizeof(r));
++	if (err) {
++		return err;
++	}
++	st.s_frames++;
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		const uint8_t *p = r + 6u * i;
++		unsigned id = p[0] >> 3, status = p[0] & 7u;
++		if (id == 0 || id > TOUCH_MAX || (status != 1u && status != 2u)) {
++			continue;
++		}
++		uint32_t px = ((uint32_t)p[1] << 4) | (p[3] >> 4u);
++		uint32_t py = ((uint32_t)p[2] << 4) | (p[3] & 15u);
++		if (px > nvt_max_x || py > nvt_max_y) {
++			continue;
++		}
++		id--;
++		mask |= 1u << id;
++		/* chip range -> 1080x2340 panel pixels, + 30 into SweetHID's canvas (touch_ft8719) */
++		x[id] = (int)(px * (FT_PANEL_W - 1u) / nvt_max_x);
++		y[id] = (int)(py * (FT_PANEL_H - 1u) / nvt_max_y) + 30;
++		if (!(st.active & (1u << id)) && nvt_logged < 20) {
++			nvt_logged++;
++			printf("SWEET TOUCH: finger %u down raw %u,%u -> %d,%d\n", id, px, py, x[id], y[id]);
++		}
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/* ginkgo NT36672A: probe, firmware download, then poll every 10 ms. */
++static void
++touch_nt36672a(const uint8_t *fw, uint32_t fsize)
++{
++	st.stage = "nvt probe";
++	printf("SWEET TOUCH: ginkgo NT36672A over SPI mode 0, firmware %u bytes, reset=%#x/%#x irq=%#x\n",
++	    fsize, touch_rd(st.west, TOUCH_GPIO_CFG(NVT_PIN_RESET)),
++	    touch_rd(st.west, TOUCH_GPIO_IO(NVT_PIN_RESET)), touch_rd(st.west, TOUCH_GPIO_IO(FT_PIN_IRQ)));
++	/* As the vendor probe: engineering reset, reset line high, 10 ms. */
++	(void)nvt_write_byte(NVT_ENG_RST, 0x5a);
++	touch_wait(1);
++	if (!(touch_rd(st.west, TOUCH_GPIO_CFG(NVT_PIN_RESET)) & 0x200u) ||
++	    !(touch_rd(st.west, TOUCH_GPIO_IO(NVT_PIN_RESET)) & 2u)) {
++		printf("SWEET TOUCH: reset GPIO87 not driven high; driving it high\n");
++		touch_gpio(NVT_PIN_RESET, 0, 0, 3, true, true);
++	}
++	touch_wait(10);
++	if (!nvt_check_chip()) {
++		printf("SWEET TOUCH: no NT36672A answers; stopping\n");
++		return;
++	}
++	st.stage = "nvt fw download";
++	if (nvt_download(fw, fsize)) {
++		printf("SWEET TOUCH: NT36672A firmware download failed; stopping\n");
++		return;
++	}
++	touch_wait(50);
++	if (nvt_identify()) {
++		printf("SWEET TOUCH: NT36672A firmware does not answer; stopping\n");
++		return;
++	}
++	st.kind = TOUCH_NVT;
++	st.stage = "polling";
++	printf("SWEET TOUCH: polling NT36672A, range %ux%u -> %dx%d, 10 ms\n",
++	    nvt_max_x, nvt_max_y, FT_PANEL_W, FT_PANEL_H);
++	unsigned errors = 0;
++	while (!st.dead) {
++		int err = touch_nvt_frame();
++		if (err) {
++			st.s_errs++;
++			if ((errors++ % 100u) == 0) {
++				printf("SWEET TOUCH: frame err=%d irq=%#x\n", err, st.irq_status);
++			}
++			if (errors == 10) {
++				touch_report(0, st.x, st.y);
++			}
++		} else {
++			errors = 0;
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++}
++
+ /* ginkgo main loop; returns when the driver stops. */
+ static void
+ touch_ginkgo(void)
+ {
++	uint32_t nvt_size = 0;
++	const uint8_t *nvt_fw = nvt_firmware(&nvt_size);
+ 	st.stage = "spi init";
+-	printf("SWEET TOUCH: SPI init\n");
+-	if (!spi_se_init()) {
++	printf("SWEET TOUCH: SPI init (%s)\n", nvt_fw ? "NT36672A firmware in payload" : "FT8719");
++	if (!spi_se_init(nvt_fw == NULL)) {
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: SPI init done, pins next\n");
+@@ -1125,6 +1552,10 @@ touch_ginkgo(void)
+ 		touch_gpio(pin, 1, 0, 2, false, false);
+ 	}
+ 	touch_gpio(FT_PIN_IRQ, 0, 3, 3, false, false);
++	if (nvt_fw) {
++		touch_nt36672a(nvt_fw, nvt_size);
++		return;
++	}
+ 	printf("SWEET TOUCH: ginkgo FT8719 over SPI, reset=%#x irq=%#x\n",
+ 	    touch_rd(st.west, TOUCH_GPIO_IO(FT_PIN_RESET)),
+ 	    touch_rd(st.west, TOUCH_GPIO_IO(FT_PIN_IRQ)));

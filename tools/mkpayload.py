@@ -27,7 +27,8 @@ ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
 
 --touchfw does the same for a touch controller firmware image (ginkgo FT8719,
-e.g. fw_huaxing_v09.bin): one more segment after the kernel/ramdisk and
+e.g. fw_huaxing_v09.bin, or NT36672A, e.g. novatek_ts_ebbg_fw.bin: the kernel
+picks the driver from the image's header): one more segment after the kernel/ramdisk and
 /chosen/memory-map "TouchFirmware" = <phys, exact byte size>. The image only
 goes into this payload; keep it out of git and out of CI artifacts.
 """
