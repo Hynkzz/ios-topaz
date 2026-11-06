@@ -1,0 +1,100 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index a7b98d7..8a86f4b 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1060,6 +1060,23 @@ spi_se_init(bool mode1)
+ 	return true;
+ }
+ 
++/*
++ * Where the 2340-line panel sits in SweetHID's 1125x2436 canvas: top-aligned
++ * (0) unless sweetfb_offy=N, the boot-arg SweetFramebuffer.cpp reads too.
++ * SweetHID itself adds 18 (its 2400-line centring), hence the - 18 below.
++ */
++static int
++touch_offy(void)
++{
++	static int offy = -1;
++	if (offy < 0) {
++		int v = 0;
++		(void)PE_parse_boot_argn("sweetfb_offy", &v, sizeof(v));
++		offy = v >= 0 && v <= 2436 - FT_PANEL_H ? v : 0;
++	}
++	return offy;
++}
++
+ static int
+ touch_ft8719(void)
+ {
+@@ -1104,7 +1121,7 @@ touch_ft8719(void)
+ 		 * 2340-line ginkgo panel sits at y + 48 in the same canvas.
+ 		 */
+ 		x[id] = px;
+-		y[id] = py + 30;
++		y[id] = py + touch_offy() - 18;
+ 	}
+ 	touch_report(mask, x, y);
+ 	return 0;
+@@ -1447,9 +1464,9 @@ nvt_identify(void)
+ 
+ /*
+  * Panel pixel -> SweetHID's 1125x2436 canvas, where the 1080x2340 panel sits at
+- * +20,+48: 1:1 inside, but the outer NVT_EDGE pixels stretched onto the canvas
+- * border, so a swipe from the glass edge starts at iOS's screen edge (home
+- * indicator, Control Center, back swipe) instead of 48 px inside it.
++ * +20,+touch_offy(): 1:1 inside, but the outer NVT_EDGE pixels stretched onto
++ * the canvas border, so a swipe from the glass edge starts at iOS's screen
++ * edge (home indicator, Control Center, back swipe), not inside it.
+  */
+ #define NVT_EDGE          48u
+ #define NVT_CANVAS_W      1125u
+@@ -1498,7 +1515,7 @@ touch_nvt_frame(void)
+ 		uint32_t cx = nvt_edge(px * (FT_PANEL_W - 1u) / nvt_max_x, FT_PANEL_W,
+ 		    (NVT_CANVAS_W - FT_PANEL_W) / 2u & ~3u, NVT_CANVAS_W);
+ 		uint32_t cy = nvt_edge(py * (FT_PANEL_H - 1u) / nvt_max_y, FT_PANEL_H,
+-		    (NVT_CANVAS_H - FT_PANEL_H) / 2u, NVT_CANVAS_H);
++		    (uint32_t)touch_offy(), NVT_CANVAS_H);
+ 		x[id] = (int)cx - (int)NVT_OFF_X;
+ 		y[id] = (int)cy - (int)NVT_OFF_Y;
+ 		if (!(st.active & (1u << id)) && nvt_logged < 20) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7c32fdb..2bb0139 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -282,6 +282,19 @@ AppleCLCD::start(IOService *provider)
+ 	/* x rounded down to 4 pixels: the panel window must start 16-byte aligned (MDP fetch) */
+ 	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * ginkgo's 2340-line panel: top-aligned in the canvas, so the status bar
++	 * (laid out for the iPhone X ears) is not cut; what falls off is the
++	 * bottom safe area under the home indicator. sweetfb_offy=N overrides;
++	 * the touch drivers read the same boot-arg (sweet_touch.c).
++	 */
++	if (fHeight == 2340 && fLogicalH > fHeight) {
++		int32_t offy = 0;
++		(void)PE_parse_boot_argn("sweetfb_offy", &offy, sizeof(offy));
++		if (offy >= 0 && offy <= (int32_t)(fLogicalH - fHeight)) {
++			fOffY = offy;
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -750,9 +763,14 @@ void
+ AppleCLCD::setPanelLevel(uint32_t level)
+ {
+ 	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
+-	uint8_t hdr[4] = { 0x51, (uint8_t)level, 0x15, 0x80 };             /* short write, 1 parameter */
++	uint8_t cmd8[2] = { 0x51, (uint8_t)level };
+ 	IOLockLock(fBlLock);
+-	bool done = fBl8 ? dsiSend(hdr, NULL, 0) : dsiDcsLong(cmd, sizeof(cmd));
++	/*
++	 * ginkgo: a short write (type 0x15) completes but the panel ignores it;
++	 * long writes reach it (51 00 01 turned the backlight off), so the one
++	 * byte goes as a two-byte long write.
++	 */
++	bool done = fBl8 ? dsiDcsLong(cmd8, sizeof(cmd8)) : dsiDcsLong(cmd, sizeof(cmd));
+ 	IOLockUnlock(fBlLock);
+ 	static uint32_t logs;
+ 	if (logs++ < 8 || !done) {
