@@ -1,0 +1,295 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_a610.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_a610.c
+@@ -0,0 +1,279 @@
++/*
++ * ginkgo (SM6125 "trinket"): the Adreno 610, woken step by step.
++ *
++ * The steps, the addresses and the order are willow-hackios's
++ * xnu/files/bsd/dev/redwood_a610.c (Redmi Note 8T, the same SoC; APSL 2.0),
++ * steps 1-6; register layouts from Xiaomi's kernel, gpucc-trinket.c,
++ * gcc-trinket.c, adreno_a6xx.c. The A610 has no GMU: the GPU is powered by
++ * its two GDSCs (CX: bus interface, SMMU, registers; GX: the 3D core) and
++ * its clocks. A GPU register read while CX is off hangs the bus, so reads of
++ * what is always there come first.
++ *
++ * Nothing runs at boot. With boot-arg sweetgpu=1, `sysctl kern.sweetgpu=N`
++ * (as root, over ssh) runs steps 1 to N in the caller's thread, each line
++ * printed before it touches anything; reading kern.sweetgpu gives the last
++ * step that completed (0: none, negative: the step that failed).
++ *
++ *   1  reads   the GPU's clocks in the global clock controller
++ *   2  reads   the GPU clock controller: PLLs, clock sources, clocks, GDSCs
++ *   3  reads   the speed-bin fuse
++ *   4  writes  the bus clocks on, CX's GDSC on, the CX clocks on
++ *   5  writes  GX's GDSC on, the 3D core's clock from the 19.2 MHz crystal
++ *   6  reads   the first registers of the GPU block (RBBM_STATUS)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <sys/errno.h>
++#include <sys/param.h>
++#include <sys/sysctl.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define GCC_PHYS                0x01400000UL
++#define GCC_SIZE                0x80000UL
++#define GPUCC_PHYS              0x05990000UL
++#define GPUCC_SIZE              0x9000UL
++#define GPU_PHYS                0x05900000UL
++#define GPU_SIZE                0x90000UL
++#define QFPROM_PHYS             0x01b40000UL
++#define QFPROM_SIZE             0x7000UL
++
++#define CLOCK_OFF               (1u << 31)      /* branch control: the clock does not run */
++#define CLOCK_ENABLE            (1u << 0)
++#define GDSC_ON                 (1u << 31)      /* GDSCR: power is on */
++#define GDSC_SW_COLLAPSE        (1u << 0)       /* GDSCR: asked to be off */
++
++#define GDSC_CX                 0x106c
++#define GDSC_GX                 0x100c
++
++static vm_offset_t gcc, gpucc, gpu, qfprom;
++static int a610_done;
++static LCK_GRP_DECLARE(a610_grp, "sweet_a610");
++static LCK_MTX_DECLARE(a610_lock, &a610_grp);
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++	__builtin_arm_dsb(0xf);
++}
++
++/* A branch clock on, and whether it runs within 2 ms (`check`: voted clocks have no halt bit to go by). */
++static bool
++clock_on(const char *name, vm_offset_t base, uint32_t offset, bool check)
++{
++	wr(base + offset, rd(base + offset) | CLOCK_ENABLE);
++	for (int i = 0; check && i < 200; i++) {
++		if (!(rd(base + offset) & CLOCK_OFF)) {
++			printf("SWEET A610: %s on (%#x)\n", name, rd(base + offset));
++			return true;
++		}
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	printf("SWEET A610: %s: %s (%#x)\n", name, check ? "DOES NOT RUN" : "asked for", rd(base + offset));
++	return !check;
++}
++
++/* A GDSC on: its collapse bit cleared, then up to 5 ms for it to say it is on. */
++static bool
++gdsc_on(const char *name, uint32_t offset)
++{
++	wr(gpucc + offset, rd(gpucc + offset) & ~GDSC_SW_COLLAPSE);
++	for (int i = 0; i < 500; i++) {
++		if (rd(gpucc + offset) & GDSC_ON) {
++			printf("SWEET A610: GDSC %s ON (%#x) after %d us\n", name, rd(gpucc + offset), 10 * i);
++			return true;
++		}
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	printf("SWEET A610: GDSC %s DOES NOT COME ON (%#x)\n", name, rd(gpucc + offset));
++	return false;
++}
++
++static bool
++gdsc_state(const char *name, uint32_t offset)
++{
++	uint32_t value = rd(gpucc + offset);
++
++	printf("SWEET A610: GDSC %s (%#x) = %#010x: %s%s\n", name, offset, value, (value & GDSC_ON) ? "ON" : "off",
++	    (value & GDSC_SW_COLLAPSE) ? ", asked to be off" : "");
++	return (value & GDSC_ON) != 0;
++}
++
++struct named {
++	const char *name;
++	uint32_t    offset;
++};
++
++static void
++branches(const char *where, vm_offset_t base, const struct named *list, unsigned count)
++{
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t value = rd(base + list[i].offset);
++
++		printf("SWEET A610: %s %-28s (%#07x) = %#010x  %s\n", where, list[i].name, list[i].offset, value,
++		    (value & CLOCK_OFF) ? "off" : "RUNS");
++	}
++}
++
++/* Steps 1 to `steps`; returns the last one completed, or minus the one that failed. */
++static int
++a610_run(int steps)
++{
++	bool cx_on;
++
++	printf("SWEET A610: step 1: GPU clocks in GCC (%#lx)\n", GCC_PHYS);
++	if (gcc == 0) {
++		gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	}
++	{
++		static const struct named list[] = {
++			{ "gcc_gpu_cfg_ahb_clk", 0x36004 }, { "gcc_gpu_memnoc_gfx_clk", 0x3600c },
++			{ "gcc_gpu_snoc_dvm_gfx_clk", 0x36018 }, { "gcc_gpu_throttle_xo_clk", 0x36044 },
++			{ "gcc_bimc_gpu_axi_clk", 0x71154 }, { "gcc_sys_noc_compute_sf_axi", 0x1050c },
++		};
++
++		branches("gcc", gcc, list, sizeof(list) / sizeof(list[0]));
++		printf("SWEET A610: gcc votes 0x79004 = %#010x\n", rd(gcc + 0x79004));
++	}
++	if (steps < 2) {
++		return 1;
++	}
++
++	printf("SWEET A610: step 2: GPU clock controller (%#lx)\n", GPUCC_PHYS);
++	if (gpucc == 0) {
++		gpucc = ml_io_map(GPUCC_PHYS, GPUCC_SIZE);
++	}
++	for (uint32_t pll = 0; pll < 2; pll++) {
++		vm_offset_t p = gpucc + 0x100 * pll;
++
++		printf("SWEET A610: PLL%u mode %#010x L %#x alpha %#x %#x user %#x %#x config %#x %#x status %#x\n", pll,
++		    rd(p + 0x00), rd(p + 0x04), rd(p + 0x08), rd(p + 0x0c), rd(p + 0x10), rd(p + 0x14), rd(p + 0x18),
++		    rd(p + 0x1c), rd(p + 0x24));
++	}
++	printf("SWEET A610: gx_gfx3d_clk_src cmd %#x cfg %#x; gmu_clk_src cmd %#x cfg %#x\n",
++	    rd(gpucc + 0x101c), rd(gpucc + 0x1020), rd(gpucc + 0x1120), rd(gpucc + 0x1124));
++	{
++		static const struct named list[] = {
++			{ "gpu_cc_cxo_aon_clk", 0x1004 }, { "gpu_cc_gx_gfx3d_clk", 0x1054 }, { "gpu_cc_ahb_clk", 0x1078 },
++			{ "gpu_cc_crc_ahb_clk", 0x107c }, { "gpu_cc_cx_apb_clk", 0x1088 }, { "gpu_cc_cx_snoc_dvm_clk", 0x108c },
++			{ "gpu_cc_sleep_clk", 0x1090 }, { "gpu_cc_cx_gmu_clk", 0x1098 }, { "gpu_cc_cxo_clk", 0x109c },
++			{ "gpu_cc_cx_gfx3d_clk", 0x10a4 }, { "gpu_cc_hlos1_vote_gpu_smmu", 0x5000 },
++		};
++
++		branches("gpucc", gpucc, list, sizeof(list) / sizeof(list[0]));
++	}
++	cx_on = gdsc_state("CX", GDSC_CX);
++	(void)gdsc_state("GX", GDSC_GX);
++	printf("SWEET A610: CX hardware control (0x1540) = %#x\n", rd(gpucc + 0x1540));
++	if (steps < 3) {
++		return 2;
++	}
++
++	printf("SWEET A610: step 3: fuses (%#lx)\n", QFPROM_PHYS);
++	if (qfprom == 0) {
++		qfprom = ml_io_map(QFPROM_PHYS, QFPROM_SIZE);
++	}
++	/* qcom,gpu-gaming-bin = <0x6018 0x80 7> */
++	printf("SWEET A610: fuse 0x6018 = %#010x (gaming bin bit 7 = %u)\n", rd(qfprom + 0x6018),
++	    (rd(qfprom + 0x6018) >> 7) & 1);
++	if (steps < 4) {
++		return 3;
++	}
++
++	printf("SWEET A610: step 4: bus clocks, CX GDSC, CX clocks\n");
++	if (!clock_on("gcc_gpu_memnoc_gfx_clk", gcc, 0x3600c, false) ||
++	    !clock_on("gcc_bimc_gpu_axi_clk", gcc, 0x71154, false) ||
++	    !clock_on("gcc_sys_noc_compute_sf_axi_clk", gcc, 0x1050c, true) ||
++	    !clock_on("gcc_gpu_snoc_dvm_gfx_clk", gcc, 0x36018, false)) {
++		return -4;
++	}
++	if (!cx_on && !gdsc_on("CX", GDSC_CX)) {
++		return -4;
++	}
++	/* kgsl has CX on before these; they did not run on willow until it was */
++	delay_for_interval(100, NSEC_PER_USEC);
++	(void)clock_on("gcc_gpu_memnoc_gfx_clk (CX on)", gcc, 0x3600c, true);
++	(void)clock_on("gcc_gpu_snoc_dvm_gfx_clk (CX on)", gcc, 0x36018, true);
++	(void)clock_on("gcc_bimc_gpu_axi_clk (CX on)", gcc, 0x71154, false);
++	/* GMU wrapper clock: the vendor's wake and sleep counts (0xf each) first */
++	wr(gpucc + 0x1098, (rd(gpucc + 0x1098) & ~0xff0u) | 0xf << 8 | 0xf << 4);
++	if (!clock_on("gpu_cc_ahb_clk", gpucc, 0x1078, true) || !clock_on("gpu_cc_cxo_clk", gpucc, 0x109c, true) ||
++	    !clock_on("gpu_cc_cx_gmu_clk", gpucc, 0x1098, false) ||
++	    !clock_on("gpu_cc_hlos1_vote_gpu_smmu", gpucc, 0x5000, false)) {
++		return -4;
++	}
++	if (steps < 5) {
++		return 4;
++	}
++
++	printf("SWEET A610: step 5: GX GDSC, 3D core clock from the crystal\n");
++	if (!gdsc_on("GX", GDSC_GX)) {
++		return -5;
++	}
++	/* gx_gfx3d_clk_src: input 0 (the crystal), no divider; then update and wait for it */
++	wr(gpucc + 0x1020, rd(gpucc + 0x1020) & ~0x71fu);
++	wr(gpucc + 0x101c, rd(gpucc + 0x101c) | 1);
++	for (int i = 0; i < 500 && (rd(gpucc + 0x101c) & 1); i++) {
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	printf("SWEET A610: gx_gfx3d_clk_src cmd %#x cfg %#x\n", rd(gpucc + 0x101c), rd(gpucc + 0x1020));
++	if (!clock_on("gpu_cc_gx_gfx3d_clk", gpucc, 0x1054, true)) {
++		return -5;
++	}
++	if (steps < 6) {
++		return 5;
++	}
++
++	printf("SWEET A610: step 6: GPU block registers (%#lx)\n", GPU_PHYS);
++	if (gpu == 0) {
++		gpu = ml_io_map(GPU_PHYS, GPU_SIZE);
++	}
++	/* words: RBBM_STATUS 0x210, RBBM_STATUS3 0x213, CP_SQE_INSTR_BASE 0x830 */
++	printf("SWEET A610: RBBM_STATUS %#x RBBM_STATUS3 %#x CP_SQE_INSTR_BASE %#x:%#x\n",
++	    rd(gpu + 4 * 0x210), rd(gpu + 4 * 0x213), rd(gpu + 4 * 0x830), rd(gpu + 4 * 0x831));
++	return 6;
++}
++
++static int
++sysctl_sweetgpu SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = a610_done, enabled = 0, error;
++	DTEntry node;
++
++	error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (!PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled)) || enabled != 1 ||
++	    SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) != kSuccess) {
++		return EPERM;   /* ginkgo only, and only with boot-arg sweetgpu=1 */
++	}
++	if (value < 1 || value > 6) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&a610_lock);
++	printf("SWEET A610: steps 1-%d\n", value);
++	a610_done = a610_run(value);
++	printf("SWEET A610: result %d\n", a610_done);
++	lck_mtx_unlock(&a610_lock);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetgpu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweetgpu, "I", "ginkgo Adreno 610 bring-up steps (boot-arg sweetgpu=1)");
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
