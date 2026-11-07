@@ -1,0 +1,34 @@
+name: gputest
+
+# tools/gputest: test programs for the GPU service SweetGPU (ginkgo), arm64
+# iOS 16, ad-hoc signed. Minutes, not a kernel build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macos-15 (arm64) or macos-15-intel when the arm64 queue is long
+        default: macos-15-intel
+  push:
+    branches: [main, ginkgo-sd]
+    paths:
+      - "tools/gputest/**"
+      - ".github/workflows/gputest.yml"
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          CC="$(xcrun -sdk iphoneos -f clang) -arch arm64 -isysroot $SDK -miphoneos-version-min=16.0"
+          mkdir -p out
+          $CC -O2 -Wall -Werror -o out/sweetgpu_test tools/gputest/sweetgpu_test.c -framework IOKit -framework CoreFoundation
+          codesign -f -s - out/sweetgpu_test
+          file out/sweetgpu_test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gputest-ios-arm64
+          path: out/
