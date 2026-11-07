@@ -74,6 +74,7 @@ struct drm_gem_close { uint32_t handle, pad; };
 #define PICTURE_SIZE            65536u          /* 64 x 64 pixels, rows of 256 bytes, then words for CP_MEM_WRITE */
 #define PICTURE_ROW             256u
 #define WRITTEN_AT              (PICTURE_ROW * 64)
+#define FLUSHED_AT              (WRITTEN_AT + 64)
 
 static io_connect_t gpu;
 static uint32_t *emit, emitted;
@@ -197,9 +198,12 @@ round_once(int round)
 	command(CP_WAIT_FOR_IDLE, 0);
 	command(CP_BLIT, 1);
 	put(3);
-	command(CP_EVENT_WRITE, 1);
+	/* PC_CCU_FLUSH_COLOR_TS: a timestamp event, so it takes where to write when done (as the kernel's ring_2d_end) */
+	command(CP_EVENT_WRITE, 4);
 	put(EVENT_FLUSH_COLOR);
-	command(CP_WAIT_FOR_IDLE, 0);
+	put((uint32_t)(pic_at + FLUSHED_AT));
+	put((uint32_t)((pic_at + FLUSHED_AT) >> 32));
+	put(0x0f1a5bed);
 
 	bos[0] = (struct msm_gem_submit_bo){ .flags = MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE, .handle = pic_handle };
 	bos[1] = (struct msm_gem_submit_bo){ .flags = MSM_SUBMIT_BO_READ, .handle = cmd_handle };
@@ -230,6 +234,7 @@ round_once(int round)
 	}
 	printf("words: %#x %#x %#x %#x (told 0x600dc0de 0x5ee6f00d %#x 0xfeedface)\n", pic[WRITTEN_AT / 4],
 	    pic[WRITTEN_AT / 4 + 1], pic[WRITTEN_AT / 4 + 2], pic[WRITTEN_AT / 4 + 3], round);
+	printf("flush word %#x (told 0xf1a5bed)\n", pic[FLUSHED_AT / 4]);
 	printf("pixels: first %#x, middle %#x, last %#x (told 0xffe09030)\n", pic[0], pic[32 * 64 + 32], pic[64 * 64 - 1]);
 	bad |= pic[WRITTEN_AT / 4] != 0x600dc0de || pic[WRITTEN_AT / 4 + 2] != (uint32_t)round;
 	bad |= pic[0] != 0xffe09030 || pic[32 * 64 + 32] != 0xffe09030 || pic[64 * 64 - 1] != 0xffe09030;
