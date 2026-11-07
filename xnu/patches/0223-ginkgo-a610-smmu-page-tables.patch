@@ -1,0 +1,323 @@
+diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
+index 49679a6..4fb199c 100644
+--- a/bsd/dev/sweet_a610.c
++++ b/bsd/dev/sweet_a610.c
+@@ -47,6 +47,13 @@
+  *  13  commands the 2D engine to fill a 16x64 rectangle in the scratch area
+  *              with one colour (Mesa's fd6_clear_surface, as willow's step 13)
+  *              and reads it back
++ * With boot-arg sweetgpu_smmu=1 step 11 gives the core addresses of its own
++ * instead: page tables of ours in SMMU context 0 (willow's space_* and
++ * space_on, from Linux io-pgtable-arm.c / arm-smmu.c: 4K pages, 39 bits,
++ * stage 1 with stage 2 bypassed), the ring, microcode and scratch page at
++ * CORE_ADDRESS, and step 14 maps the framebuffer at TARGET_ADDRESS. That is
++ * what buffers made of scattered pages (Mesa's) will need.
++ *
+  *  14  commands the 2D engine to fill the panel's framebuffer (the boot
+  *              framebuffer the MDP scans with sweetfb_noflip=1, 0x5c000000,
+  *              untranslated like everything else here) with three bands:
+@@ -183,6 +190,33 @@ extern uint64_t kvtophys(vm_offset_t va);
+ #define FILL_HEIGHT             ((FB_ROW * FB_HEIGHT) / FILL_ROW)
+ #define TEST_OFFSET             (CORE_SCRATCH_OFFSET + 0x1000u)
+ #define CP_MEM_WRITE            0x3d
++
++#define CORE_ADDRESS            0x01000000ull   /* sweetgpu_smmu=1: ring, microcode, scratch for the core */
++#define TARGET_ADDRESS          0x10000000ull   /* sweetgpu_smmu=1: the framebuffer for the core */
++#define PTE_TABLE               3ull
++#define PTE_PAGE                3ull
++#define PTE_CORE                (1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)  /* EL0, shared, AF, nG; MAIR 0 uncached */
++#define PTE_ADDRESS             0x0000fffffffff000ull
++#define SPACE_TABLES            64
++#define SMMU_CB_TCR2            0x10
++#define SMMU_CB_TTBR0           0x20
++#define SMMU_CB_TTBR1           0x28
++#define SMMU_CB_TCR             0x30
++#define SMMU_CB_MAIR0           0x38
++#define SMMU_CB_MAIR1           0x3c
++#define SMMU_CB_FSR             0x58
++#define SMMU_CB_FAR             0x60
++#define SMMU_CB_FSYNR0          0x68
++#define SMMU_CB_TLBIASID        0x610
++#define SMMU_CB_TLBSYNC         0x7f0
++#define SMMU_CB_TLBSTATUS       0x7f4
++#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
++#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
++#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
++#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)
++#define SMMU_MAIR0              0xf404ff44
++#define SMMU_FSR_ALL            0xc00001fe
++#define SMMU_GPU_SMR            (1u << 31 | 1u << 16 | 0)       /* dt gfx3d_user: SID 0 mask 1 */
+ #define CP_ME_INIT              0x48
+ #define CP_SET_SECURE_MODE      0x66
+ 
+@@ -206,6 +240,9 @@ static int a610_done;
+ static bool zap_loaded, cp_running;
+ static vm_offset_t core_memory;         /* ring, microcode, scratch page: one piece */
+ static uint64_t core_phys;
++static uint64_t core_address;            /* where the core sees the ring: core_phys, or CORE_ADDRESS */
++static bool translated;
++static bool space_faulted(const char *when);
+ static uint32_t ring_at, ring_sent;
+ static LCK_GRP_DECLARE(a610_grp, "sweet_a610");
+ static LCK_MTX_DECLARE(a610_lock, &a610_grp);
+@@ -493,9 +530,139 @@ ring_run(const char *what)
+ 	    taken, ring_at, status, rd(gpu + RBBM_INT_0_STATUS), rd(gpu + CP_HW_FAULT), rd(gpu + CP_INTERRUPT_STATUS),
+ 	    rd(gpu + CP_PROTECT_STATUS));
+ 	smmu_faults("now");
++	(void)space_faulted("now");
+ 	return false;
+ }
+ 
++/*
++ * Page tables of ours for SMMU context 0 (willow-hackios redwood_a610.c
++ * space_*): three levels of 4K tables, each at the start of a kernel page.
++ */
++static struct {
++	uint32_t count;
++	uint64_t *table[SPACE_TABLES];
++	uint64_t phys[SPACE_TABLES];
++} space;
++
++static uint64_t *
++space_table(uint64_t *entry)
++{
++	vm_offset_t page;
++
++	if (entry != NULL && (*entry & 1)) {
++		for (uint32_t i = 0; i < space.count; i++) {
++			if (space.phys[i] == (*entry & PTE_ADDRESS)) {
++				return space.table[i];
++			}
++		}
++		return NULL;
++	}
++	if (space.count == SPACE_TABLES || kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	space.table[space.count] = (uint64_t *)page;
++	space.phys[space.count++] = kvtophys(page);
++	if (entry != NULL) {
++		*entry = kvtophys(page) | PTE_TABLE;
++	}
++	return (uint64_t *)page;
++}
++
++/* One 4K page of the core's addresses to a physical page. */
++static bool
++space_map(uint64_t address, uint64_t phys)
++{
++	uint64_t *level2, *level3;
++
++	if (address >> 39 || (space.count == 0 && space_table(NULL) == NULL)) {
++		return false;
++	}
++	if ((level2 = space_table(&space.table[0][address >> 30 & 0x1ff])) == NULL ||
++	    (level3 = space_table(&level2[address >> 21 & 0x1ff])) == NULL) {
++		return false;
++	}
++	level3[address >> 12 & 0x1ff] = (phys & PTE_ADDRESS) | PTE_CORE | PTE_PAGE;
++	return true;
++}
++
++/* Kernel memory (`size` bytes of pages) at an address of the core's. */
++static bool
++space_block(uint64_t address, vm_offset_t memory, uint32_t size)
++{
++	for (uint32_t offset = 0; offset < size; offset += 4096) {
++		if (!space_map(address + offset, kvtophys(memory + offset))) {
++			printf("SWEET A610: no room for the tables at %#llx\n", address + offset);
++			return false;
++		}
++	}
++	return true;
++}
++
++/* The tables out to memory, the TLB of context 0 invalidated. */
++static void
++space_commit(void)
++{
++	vm_offset_t cb = smmu + 0x8000;
++
++	for (uint32_t i = 0; i < space.count; i++) {
++		to_memory((vm_offset_t)space.table[i], 4096);
++	}
++	wr(cb + SMMU_CB_TLBIASID, 0);
++	wr(cb + SMMU_CB_TLBSYNC, 1);
++	for (int i = 0; i < 1000 && (rd(cb + SMMU_CB_TLBSTATUS) & 1); i++) {
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++}
++
++/* Context 0 with our tables and the GPU's stream through it; what the SMMU took is checked. */
++static bool
++space_on(void)
++{
++	vm_offset_t cb = smmu + 0x8000;
++	uint64_t root = space.phys[0];
++
++	wr(cb + 0x00, 0);
++	wr(smmu + 0x1800, 1);                   /* CBA2R 0: 64-bit */
++	wr(smmu + 0x1000, SMMU_CBAR_STAGE_1);   /* CBAR 0 */
++	wr(cb + SMMU_CB_TCR2, SMMU_TCR2);
++	wr(cb + SMMU_CB_TCR, SMMU_TCR_39_BITS);
++	put64(cb + SMMU_CB_TTBR0, root);
++	put64(cb + SMMU_CB_TTBR1, 0);
++	wr(cb + SMMU_CB_MAIR0, SMMU_MAIR0);
++	wr(cb + SMMU_CB_MAIR1, 0);
++	wr(cb + SMMU_CB_FSR, SMMU_FSR_ALL);
++	space_commit();
++	wr(cb + 0x00, SMMU_SCTLR_ON);
++	wr(smmu + 0xc00, 0);                    /* S2CR 0: translate, context 0 */
++	wr(smmu + 0x800, SMMU_GPU_SMR);
++	__builtin_arm_dsb(0xf);
++	printf("SWEET A610: SMMU context 0 CBAR %#x CBA2R %#x SCTLR %#x TCR %#x TCR2 %#x TTBR0 %#x:%#x (ours %#llx); SMR0 %#x S2CR0 %#x\n",
++	    rd(smmu + 0x1000), rd(smmu + 0x1800), rd(cb), rd(cb + SMMU_CB_TCR), rd(cb + SMMU_CB_TCR2),
++	    rd(cb + SMMU_CB_TTBR0 + 4), rd(cb + SMMU_CB_TTBR0), root, rd(smmu + 0x800), rd(smmu + 0xc00));
++	if (rd(smmu + 0x800) != SMMU_GPU_SMR || (rd(smmu + 0xc00) & 0x300ff) != 0 || !(rd(cb) & 1) ||
++	    rd(cb + SMMU_CB_TTBR0) != (uint32_t)root || rd(cb + SMMU_CB_TTBR0 + 4) != (uint32_t)(root >> 32)) {
++		printf("SWEET A610: the SMMU did NOT take our tables\n");
++		return false;
++	}
++	printf("SWEET A610: the GPU's stream goes through our tables (%u of them)\n", space.count);
++	return true;
++}
++
++/* What context 0 recorded of a request it could not serve. */
++static bool
++space_faulted(const char *when)
++{
++	vm_offset_t cb = smmu + 0x8000;
++
++	if (!translated || (rd(cb + SMMU_CB_FSR) & SMMU_FSR_ALL) == 0) {
++		return false;
++	}
++	printf("SWEET A610: THE SMMU REFUSED the core %s: FSR %#x FAR %#x:%#x FSYNR0 %#x\n", when, rd(cb + SMMU_CB_FSR),
++	    rd(cb + SMMU_CB_FAR + 4), rd(cb + SMMU_CB_FAR), rd(cb + SMMU_CB_FSYNR0));
++	return true;
++}
++
+ /* A register of the core (by its word number) written by packet, in order with the other commands. */
+ static void
+ ring_register(uint32_t number, uint32_t value)
+@@ -551,13 +718,13 @@ ring_2d_end(uint32_t tag)
+ {
+ 	ring_command(CP_EVENT_WRITE, 4);
+ 	ring(EVENT_FLUSH_COLOR);
+-	ring((uint32_t)(core_phys + CORE_SCRATCH_OFFSET + 32));
+-	ring((uint32_t)((core_phys + CORE_SCRATCH_OFFSET + 32) >> 32));
++	ring((uint32_t)(core_address + CORE_SCRATCH_OFFSET + 32));
++	ring((uint32_t)((core_address + CORE_SCRATCH_OFFSET + 32) >> 32));
+ 	ring(tag);
+ 	ring_command(CP_EVENT_WRITE, 4);
+ 	ring(EVENT_CACHE_FLUSH);
+-	ring((uint32_t)(core_phys + CORE_SCRATCH_OFFSET + 16));
+-	ring((uint32_t)((core_phys + CORE_SCRATCH_OFFSET + 16) >> 32));
++	ring((uint32_t)(core_address + CORE_SCRATCH_OFFSET + 16));
++	ring((uint32_t)((core_address + CORE_SCRATCH_OFFSET + 16) >> 32));
+ 	ring(tag + 1);
+ 	ring_command(CP_WAIT_FOR_IDLE, 0);
+ }
+@@ -857,9 +1024,20 @@ a610_run(int steps)
+ 		const uint32_t cb = 4;
+ 		vm_offset_t cbase = smmu + 0x8000 + 0x1000 * cb;
+ 
++		uint32_t want_tables = 0;
++
+ 		if (smmu == 0) {
+ 			return -11;
+ 		}
++		(void)PE_parse_boot_argn("sweetgpu_smmu", &want_tables, sizeof(want_tables));
++		core_address = core_phys;
++		if (want_tables == 1) {
++			if (!space_block(CORE_ADDRESS, core_memory, CORE_MEMORY_SIZE) || !space_on()) {
++				return -11;
++			}
++			core_address = CORE_ADDRESS;
++			translated = true;
++		} else {
+ 		wr(cbase + 0x00, 0);                            /* SCTLR: translation off */
+ 		wr(cbase + 0x58, rd(cbase + 0x58));             /* FSR: clear */
+ 		wr(smmu + 0x1800 + 4 * cb, 1);                  /* CBA2R: 64-bit */
+@@ -875,6 +1053,7 @@ a610_run(int steps)
+ 		    rd(smmu + 0x800), rd(smmu + 0xc00), rd(smmu + 0x1000 + 4 * cb), rd(smmu + 0x1800 + 4 * cb), rd(cbase),
+ 		    rd(smmu + 0x48), (rd(smmu + 0x800) >> 31) && (rd(smmu + 0xc00) & 0x300ff) == cb ?
+ 		    "the GPU stream to a context that does not translate" : "NOT taken");
++		}
+ 		printf("SWEET A610: GBIF halt %#x ack %#x, RBBM halt %#x ack %#x\n", rd(gpu + GBIF_HALT),
+ 		    rd(gpu + GBIF_HALT_ACK), rd(gpu + RBBM_GBIF_HALT), rd(gpu + RBBM_GBIF_HALT_ACK));
+ 		wr(gpu + GBIF_HALT, 0);
+@@ -914,8 +1093,8 @@ a610_run(int steps)
+ 		wr(gpu + CP_PERFCTR_CP_SEL_0, PERF_CP_ALWAYS_COUNT);
+ 		wr(gpu + RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x3ffff);
+ 		wr(gpu + UCHE_CLIENT_PF, 1u << 7 | 1);
+-		put64(gpu + CP_SQE_INSTR_BASE, core_phys + CORE_SQE_OFFSET);
+-		put64(gpu + CP_RB_BASE, core_phys);
++		put64(gpu + CP_SQE_INSTR_BASE, core_address + CORE_SQE_OFFSET);
++		put64(gpu + CP_RB_BASE, core_address);
+ 		wr(gpu + CP_RB_CNTL, CP_RB_CNTL_VALUE);
+ 		printf("SWEET A610: microcode %#x:%#x ring %#x:%#x control %#x status %#x\n", rd(gpu + CP_SQE_INSTR_BASE + 4),
+ 		    rd(gpu + CP_SQE_INSTR_BASE), rd(gpu + CP_RB_BASE + 4), rd(gpu + CP_RB_BASE), rd(gpu + CP_RB_CNTL),
+@@ -956,7 +1135,7 @@ a610_run(int steps)
+ 	printf("SWEET A610: step 12: a word written on command\n");
+ 	{
+ 		volatile uint32_t *page = (volatile uint32_t *)(core_memory + CORE_SCRATCH_OFFSET);
+-		uint64_t target = core_phys + CORE_SCRATCH_OFFSET;
++		uint64_t target = core_address + CORE_SCRATCH_OFFSET;
+ 		uint32_t word = 0x600dc0de ^ ring_at;
+ 
+ 		page[0] = 0;
+@@ -991,7 +1170,7 @@ a610_run(int steps)
+ 		}
+ 		to_memory((vm_offset_t)test, 16 * 64 * 4);
+ 		ring_2d_begin();
+-		ring_fill(core_phys + TEST_OFFSET, 64, 16, 0, 64, 255, 128, 0);
++		ring_fill(core_address + TEST_OFFSET, 64, 16, 0, 64, 255, 128, 0);
+ 		ring_2d_end(0x0c0c0c0c);
+ 		if (!ring_run("fill a small picture")) {
+ 			return -13;
+@@ -1001,6 +1180,7 @@ a610_run(int steps)
+ 		printf("SWEET A610: flush words %#x %#x; pixels: first %#x, middle %#x, last %#x (told %#x)\n",
+ 		    page[8], page[4], test[0], test[16 * 32 + 8], test[16 * 64 - 1], expect);
+ 		smmu_faults("after the fill");
++		(void)space_faulted("after the fill");
+ 		if (test[0] != expect || test[16 * 32 + 8] != expect || test[16 * 64 - 1] != expect) {
+ 			printf("SWEET A610: the picture is not what the 2D engine was told to draw\n");
+ 			return -13;
+@@ -1016,15 +1196,33 @@ a610_run(int steps)
+ 		const uint32_t third = FILL_HEIGHT / 3;
+ 		static vm_offset_t fb_page[3];
+ 
++		uint64_t target = FB_PHYS;
++
++		if (translated) {
++			static bool mapped;
++
++			for (uint32_t offset = 0; !mapped && offset < FB_ROW * FB_HEIGHT; offset += 4096) {
++				if (!space_map(TARGET_ADDRESS + offset, FB_PHYS + offset)) {
++					return -14;
++				}
++			}
++			if (!mapped) {
++				space_commit();
++				mapped = true;
++				printf("SWEET A610: framebuffer at %#llx for the core (%u tables)\n", TARGET_ADDRESS, space.count);
++			}
++			target = TARGET_ADDRESS;
++		}
+ 		ring_2d_begin();
+-		ring_fill(FB_PHYS, FILL_ROW, FILL_ROW / 4, 0, third, 255, 128, 0);              /* orange */
+-		ring_fill(FB_PHYS, FILL_ROW, FILL_ROW / 4, third, 2 * third, 255, 255, 255);    /* white */
+-		ring_fill(FB_PHYS, FILL_ROW, FILL_ROW / 4, 2 * third, FILL_HEIGHT, 0, 128, 255); /* blue */
++		ring_fill(target, FILL_ROW, FILL_ROW / 4, 0, third, 255, 128, 0);               /* orange */
++		ring_fill(target, FILL_ROW, FILL_ROW / 4, third, 2 * third, 255, 255, 255);     /* white */
++		ring_fill(target, FILL_ROW, FILL_ROW / 4, 2 * third, FILL_HEIGHT, 0, 128, 255); /* blue */
+ 		ring_2d_end(0x0e0e0e0e);
+ 		if (!ring_run("fill the panel")) {
+ 			return -14;
+ 		}
+ 		smmu_faults("after the panel");
++		(void)space_faulted("after the panel");
+ 		{
+ 			/* one page per pixel read: the whole 10 MB is more kernel address space than ml_io_map has */
+ 			static const uint32_t rows[3] = { 10, 1170, 2300 };
