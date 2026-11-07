@@ -1,0 +1,224 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 8e31876..77a12b3 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -553,8 +553,9 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request * request)
+ 	b->size = size;
+ 	b->flags = 0;
+ 	b->fence = 0;
+-	b->dirty = true;
+ 	b->seed = surface_seed(s);
++	/* (memory whose zeroes are in memory already, nobody having written it since: nothing to clean) */
++	b->dirty = !(s->zeroInMemory && b->seed == 1);
+ 	fBufferCount++;
+ 	fBufferBytes += size;
+ 	if (fSurfaces++ < 8) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 5f749cb..d563bcd 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -48,6 +48,10 @@
+ #include <libkern/c++/OSSerialize.h>
+ #include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++
++extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c (0111): dc civac */
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -170,12 +174,161 @@ sweet_scanout_free_slot(int slot)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/*
++ * The memory of big surfaces is kept when they go, a few pieces of it, and given to the next
++ * surface of the same size (as Floppikrob/willow-hackios's MiniIOSurface does). CoreAnimation
++ * makes a surface of the whole display (1125 x 2436, 13.9 MB) for every frame and frees one:
++ * got, cleared, entered into the kernel's map and out again each time. A kept piece is cleared
++ * again a moment after it comes back, on a thread of its own, and its zeroes are pushed out of
++ * the caches there too, so that the GPU need not clean it when it first draws into it
++ * (SweetGPU.cpp); or by whoever asks for it, if that comes first. Boot-arg sweetsurf_keep=0: none kept.
++ */
++#define SWEET_KEEP_FROM         (4u << 20)
++#define SWEET_KEPT              4
++#define SWEET_KEPT_CLEAR_MS     30
++
++static struct {
++	IOBufferMemoryDescriptor *memory;
++	bool                      clear;        /* zeroed (and out of the caches) since it was last a surface's */
++	bool                      busy;         /* being zeroed right now */
++	uint64_t                  since;
++} sweet_kept[SWEET_KEPT];
++static IOLock       *sweet_kept_lock;
++static thread_call_t sweet_kept_clearing;
++static int           sweet_keep = -1;
++static uint32_t      sweet_kept_given, sweet_kept_made;
++
++static void
++sweet_kept_clear(thread_call_param_t, thread_call_param_t)
++{
++	IOLockLock(sweet_kept_lock);
++	for (unsigned int i = 0; i < SWEET_KEPT; i++) {
++		IOBufferMemoryDescriptor *memory = sweet_kept[i].memory;
++		if (memory == NULL || sweet_kept[i].clear || sweet_kept[i].busy) {
++			continue;
++		}
++		sweet_kept[i].busy = true;
++		IOLockUnlock(sweet_kept_lock);
++		bzero(memory->getBytesNoCopy(), memory->getCapacity());
++		sweet_dcache_flush((vm_offset_t)memory->getBytesNoCopy(), (unsigned)memory->getCapacity());
++		IOLockLock(sweet_kept_lock);
++		sweet_kept[i].busy = false;
++		sweet_kept[i].clear = true;
++	}
++	IOLockUnlock(sweet_kept_lock);
++}
++
++static bool
++sweet_keeping(void)
++{
++	if (sweet_keep < 0) {
++		int on = 1;
++		PE_parse_boot_argn("sweetsurf_keep", &on, sizeof(on));
++		if (on) {
++			IOLock *lock = IOLockAlloc();
++			if (!OSCompareAndSwapPtr(NULL, lock, &sweet_kept_lock)) {
++				IOLockFree(lock);
++			}
++			if (sweet_kept_clearing == NULL) {
++				sweet_kept_clearing = thread_call_allocate(sweet_kept_clear, NULL);
++			}
++		}
++		sweet_keep = on && sweet_kept_lock != NULL && sweet_kept_clearing != NULL;
++	}
++	return sweet_keep > 0;
++}
++
++/* Memory for a surface's pixels, all zeroes: a kept piece of that size, else new. */
++static IOBufferMemoryDescriptor *
++sweet_surface_buffer(uint32_t bytes, bool *zeroInMemory)
++{
++	IOBufferMemoryDescriptor *memory = NULL;
++	bool clear = false;
++
++	*zeroInMemory = false;
++	if (bytes >= SWEET_KEEP_FROM && sweet_keeping()) {
++		IOLockLock(sweet_kept_lock);
++		for (int pass = 0; pass < 2 && memory == NULL; pass++) {
++			for (unsigned int i = 0; i < SWEET_KEPT && memory == NULL; i++) {
++				if (sweet_kept[i].memory != NULL && !sweet_kept[i].busy && (pass == 1 || sweet_kept[i].clear) &&
++				    sweet_kept[i].memory->getCapacity() == bytes) {
++					memory = sweet_kept[i].memory;
++					clear = sweet_kept[i].clear;
++					sweet_kept[i].memory = NULL;
++				}
++			}
++		}
++		IOLockUnlock(sweet_kept_lock);
++		if (memory != NULL) {
++			if (!clear) {
++				bzero(memory->getBytesNoCopy(), bytes);
++			}
++			*zeroInMemory = clear;
++			if (sweet_kept_given++ % 500 == 0) {
++				IOLog("SWEET SURF: %u surfaces given kept memory, %u made afresh\n", sweet_kept_given, sweet_kept_made);
++			}
++			return memory;
++		}
++	}
++	sweet_kept_made++;
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, bytes, page_size);
++	if (memory != NULL) {
++		bzero(memory->getBytesNoCopy(), bytes);
++	}
++	return memory;
++}
++
++/* A surface's memory is no longer its: kept, if big and nobody else has it; else let go of. */
++static void
++sweet_surface_buffer_back(IOBufferMemoryDescriptor *memory)
++{
++	IOBufferMemoryDescriptor *evicted = NULL;
++
++	if (memory->getCapacity() >= SWEET_KEEP_FROM && memory->getRetainCount() == 1 && sweet_keeping()) {
++		int oldest = -1;
++
++		IOLockLock(sweet_kept_lock);
++		for (unsigned int i = 0; i < SWEET_KEPT && memory != NULL; i++) {
++			if (sweet_kept[i].memory == NULL) {
++				sweet_kept[i].memory = memory;
++				sweet_kept[i].clear = sweet_kept[i].busy = false;
++				sweet_kept[i].since = mach_absolute_time();
++				memory = NULL;
++			} else if (!sweet_kept[i].busy && (oldest < 0 || sweet_kept[i].since < sweet_kept[oldest].since)) {
++				oldest = (int)i;
++			}
++		}
++		if (memory != NULL && oldest >= 0) {
++			evicted = sweet_kept[oldest].memory;
++			sweet_kept[oldest].memory = memory;
++			sweet_kept[oldest].clear = sweet_kept[oldest].busy = false;
++			sweet_kept[oldest].since = mach_absolute_time();
++			memory = NULL;
++		}
++		IOLockUnlock(sweet_kept_lock);
++		OSSafeReleaseNULL(evicted);
++		if (memory == NULL) {
++			uint64_t deadline;
++			clock_interval_to_deadline(SWEET_KEPT_CLEAR_MS, NSEC_PER_MSEC, &deadline);
++			thread_call_enter_delayed(sweet_kept_clearing, deadline);
++			return;
++		}
++	}
++	memory->release();
++}
++
+ void
+ SweetSurface::free()
+ {
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
++	if (memory != NULL && !wrapped && scanoutSlot < 0 && kernelMap == NULL &&
++	    OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
++		sweet_surface_buffer_back((IOBufferMemoryDescriptor *)memory);
++		memory = NULL;
++	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	if (wrapped && memory != NULL) {
+ 		memory->complete();
+@@ -966,14 +1119,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			mem = sweet_surface_buffer(s->allocSize, &s->zeroInMemory);
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+-			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index b01fed2..719fc6c 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -47,9 +47,10 @@ public:
+ 	uint32_t                  useCount[2];  /* per category, mirrored in the state page; sweet_surface_lock */
+ 	uint32_t                  purgeable;
+ 	volatile uint32_t         gpuBumps;     /* seed moves by unlocks of kIOSurfaceLockGPUWrote: the GPU drew, no processor */
++	bool                      zeroInMemory; /* its zeroes are in memory already, out of the caches (SweetGPU need not clean) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; wrapped = false; values = NULL;
+-		purgeable = 0; gpuBumps = 0; useCount[0] = useCount[1] = 0; return OSObject::init(); }
++		purgeable = 0; gpuBumps = 0; zeroInMemory = false; useCount[0] = useCount[1] = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
