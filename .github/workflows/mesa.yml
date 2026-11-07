@@ -15,6 +15,7 @@ on:
     paths:
       - "tools/mesa/**"
       - "tools/mk-mesa.sh"
+      - "tools/eagl/**"
       - ".github/workflows/mesa.yml"
 jobs:
   mesa:
@@ -31,6 +32,18 @@ jobs:
           echo "$(brew --prefix flex)/bin" >> $GITHUB_PATH
       - name: build
         run: DRIVERS='${{ inputs.drivers || 'softpipe,freedreno' }}' OUT=$PWD/mesa-out BUILD_DIR=$RUNNER_TEMP/mesa tools/mk-mesa.sh
+      - name: eagl (libsweet-gl.dylib, eagl_test)
+        run: |
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          CC="$(xcrun -sdk iphoneos -f clang) -arch arm64 -isysroot $SDK -miphoneos-version-min=16.0 -O2"
+          mkdir -p obj
+          python3 tools/eagl/mkeagl.py tools/eagl/eagl_slots.txt mesa-out/gl.xml mesa-out/exported-gl.txt tools/eagl/eagl.c > obj/eagl_gen.h
+          $CC -dynamiclib -install_name /var/sweet/lib/libsweet-gl.dylib -Iobj -Itools/eagl -framework CoreFoundation \
+            -framework IOKit -framework IOSurface -lobjc mesa-out/libOSMesa.8.dylib -o mesa-out/libsweet-gl.dylib \
+            tools/eagl/eagl.c tools/eagl/gl_osmesa.c
+          $CC -framework OpenGLES -lobjc -o mesa-out/eagl_test tools/eagl/eagl_test.c
+          codesign -f -s - mesa-out/libsweet-gl.dylib mesa-out/eagl_test
+          otool -L mesa-out/libsweet-gl.dylib | head -5
       - name: logs on failure
         if: failure()
         run: |
