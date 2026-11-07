@@ -1,0 +1,98 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index ffe4d42..3184790 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -450,6 +450,11 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request * request)
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (s->wrapped) {
++		/* the creator's memory need not start on a page: the caller copies it instead */
++		s->release();
++		return kIOReturnUnsupported;
++	}
+ 	size = s->memory != NULL ? (s->memory->getLength() + 4095) & ~4095ull : 0;
+ 	if (size == 0 || size > GPU_BUFFER_MAX || (kernel = (uint8_t *) s->kernelAddress()) == NULL) {
+ 		s->release();
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0501b53..3714748 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -150,6 +150,9 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (wrapped && memory != NULL) {
++		memory->complete();
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	sweet_scanout_free_slot(scanoutSlot);
+@@ -166,7 +169,7 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(scanoutPhys ? kIOMapDefaultCache : kIOMapWriteCombineCache);
++		kernelMap = memory->map(scanoutPhys || wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -764,7 +767,42 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess && sweet_scanout_eligible(s)) {
++	OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && client != NULL) {
++		/*
++		 * A surface around memory the creator has already: CoreAnimation's OpenGL ES path
++		 * (sweetgl=1) makes them around pictures it holds (application icons, layers'
++		 * contents) to hand them to the GPU. The pixels are that memory itself, not a copy
++		 * (it goes on being drawn into); before, they were fresh zeroed memory and the icons
++		 * came out empty. Exactly as long as the creator says, not a page more.
++		 */
++		uint64_t length = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++		if (length == 0) {
++			length = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		}
++		IOReturn held = kIOReturnNoMemory;
++		for (int attempt = 0; attempt < 2 && held != kIOReturnSuccess; attempt++) {
++			/* (for writing if it can be, read-only for a picture that is only shown) */
++			OSSafeReleaseNULL(s->memory);
++			s->memory = IOMemoryDescriptor::withAddressRange(client->unsigned64BitValue(), length,
++			    attempt == 0 ? kIODirectionInOut : kIODirectionOut, current_task());
++			held = s->memory != NULL ? s->memory->prepare() : kIOReturnNoMemory;
++		}
++		if (held != kIOReturnSuccess) {
++			OSSafeReleaseNULL(s->memory);
++			IOLog("SWEET SURF: create around %llu bytes at 0x%llx: cannot hold them (0x%x)\n", length,
++			    client->unsigned64BitValue(), held);
++			ret = kIOReturnVMError;
++		} else {
++			s->wrapped = true;
++			s->allocSize = (uint32_t)length;
++			s->mapCache = kIOMapDefaultCache;
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		}
++	}
++	if (ret == kIOReturnSuccess && client == NULL && sweet_scanout_eligible(s)) {
+ 		int slot = sweet_scanout_alloc_slot();
+ 		if (slot >= 0) {
+ 			/*
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 10b39eb..4c1e27b 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -41,8 +41,9 @@ public:
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	uint64_t                  scanoutPhys;  /* topaz: physically contiguous scanout slot, or 0 */
+ 	int                       scanoutSlot;  /* pool slot, -1 when not from the pool */
++	bool                      wrapped;      /* memory is the creator's own (IOSurfaceAddress), held prepared */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; wrapped = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
