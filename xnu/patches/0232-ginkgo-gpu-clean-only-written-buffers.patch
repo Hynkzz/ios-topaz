@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
-index 3184790..dcf3409 100644
+index 3184790..7fdab22 100644
 --- a/iokit/Kernel/arm/SweetGPU.cpp
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
 @@ -167,6 +167,25 @@ struct drm_gem_close {
@@ -76,11 +76,19 @@ index 3184790..dcf3409 100644
  	fBufferCount++;
  	fBufferBytes += size;
  	if (fSurfaces++ < 8) {
-@@ -602,13 +634,24 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+@@ -561,6 +593,7 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+ 	struct msm_gem_submit_cmd * cmds = NULL;
+ 	uint64_t * addresses = NULL;
+ 	uint32_t * words = NULL, count = 0;
++	uint64_t cleaning;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+ 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
+@@ -602,13 +635,24 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
  		addresses[count] = b->address + cmds[i].submit_offset;
  		words[count++] = cmds[i].size / 4;
  	}
-+	uint64_t cleaning = mach_absolute_time();
++	cleaning = mach_absolute_time();
  	for (uint32_t i = 0; i < request->nr_bos; i++) {        /* what the program wrote, in memory for the GPU */
  		struct gpu_buffer * b = buffer(bos[i].handle);
  
@@ -102,7 +110,7 @@ index 3184790..dcf3409 100644
  	request->fence = sweet_a610_submit(addresses, words, count);
  	if (request->fence == 0) {
  		sweet_a610_report("SweetGPU: the ring is full");
-@@ -623,6 +666,13 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+@@ -623,6 +667,13 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
  			b->fence = request->fence;
  		}
  	}
@@ -116,7 +124,7 @@ index 3184790..dcf3409 100644
  	if (fSubmits++ < 4 && count != 0) {
  		IOLog("SweetGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
  		    addresses[0], words[0]);
-@@ -719,6 +769,10 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+@@ -719,6 +770,10 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
  			ret = kIOReturnBusy;
  		} else if (b != NULL && b->fence != 0) {
  			sweet_dcache_flush((vm_offset_t) b->kernel, (unsigned) b->size);       /* what the GPU wrote, for the program */
@@ -127,7 +135,7 @@ index 3184790..dcf3409 100644
  		}
  		IOLockUnlock(gGPULock);
  		break;
-@@ -733,14 +787,20 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+@@ -733,14 +788,20 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
  		} else {
  			/* what the GPU wrote, for the program: the buffers whose last submission this was */
  			for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
