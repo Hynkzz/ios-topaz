@@ -461,6 +461,8 @@ static int fetch_offered = 1;
 #define GL_SCISSOR_TEST                 0x0c11
 #define GL_SCISSOR_BOX                  0x0c10
 #define GL_COLOR_CLEAR_VALUE            0x0c22
+#define GL_COLOR_WRITEMASK              0x0c23
+#define GL_FRAMEBUFFER_BINDING          0x8ca6
 
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
