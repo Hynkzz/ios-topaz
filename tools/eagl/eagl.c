@@ -797,7 +797,28 @@ surface_shared(struct eagl *e, struct image *image)
 	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+		static uint32_t told[16];
+		uint32_t id = IOSurfaceGetID(surface);
+		bool new_one = true;
+
 		e->refused++;
+		/* ginkgo: why a big one is copied, once for each of the first 16 */
+		for (unsigned i = 0; i < 16 && told[i] != 0; i++) {
+			new_one &= told[i] != id;
+		}
+		if (new_one && IOSurfaceGetAllocSize(surface) >= 1024 * 1024 && told[15] == 0) {
+			unsigned i = 0;
+
+			while (told[i] != 0) {
+				i++;
+			}
+			told[i] = id;
+			say("redwood-gl: surface %u ('%.4s' %zu x %zu) copied, not shared: invert %d, alpha first %d, format %#x, "
+			    "type %#x, plane %u, texture %d x %d, sharing %s\n", id,
+			    (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) }, IOSurfaceGetWidth(surface),
+			    IOSurfaceGetHeight(surface), image->invert, image->alpha_first, image->format, image->type, image->plane,
+			    image->width, image->height, share_surfaces ? "on" : "off");
+		}
 		return false;
 	}
 	image->shared = true;

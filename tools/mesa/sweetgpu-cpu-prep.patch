@@ -1,0 +1,35 @@
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -679,9 +679,32 @@
+    return false;
+ }
+ 
++#ifdef __APPLE__
++static int fd_bo_cpu_prep_waited(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op);
++
++/*
++ * ginkgo's SweetGPU: the kernel cleans a big buffer out of the CPU's caches before a submission
++ * only when told the CPU may have written it, and invalidates one the GPU wrote only when told the
++ * CPU is about to read it. Below, an idle or unshared buffer never reaches the kernel; so once
++ * the GPU is done with it, the kernel hears of every CPU access (NOSYNC: nothing is waited for).
++ */
++int
++fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
++{
++   int ret = fd_bo_cpu_prep_waited(bo, pipe, op);
++
++   if (ret == 0 && (op & (FD_BO_PREP_READ | FD_BO_PREP_WRITE)))
++      bo->funcs->cpu_prep(bo, pipe, (op & (FD_BO_PREP_READ | FD_BO_PREP_WRITE)) | FD_BO_PREP_NOSYNC);
++   return ret;
++}
++
++static int
++fd_bo_cpu_prep_waited(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
++#else
+ /* a bit odd to take the pipe as an arg, but it's a, umm, quirk of kgsl.. */
+ int
+ fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
++#endif
+ {
+    enum fd_bo_state state = fd_bo_state(bo);
+ 

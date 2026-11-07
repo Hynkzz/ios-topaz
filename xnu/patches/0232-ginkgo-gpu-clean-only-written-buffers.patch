@@ -1,0 +1,152 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 3184790..1d57953 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -167,6 +167,25 @@ struct drm_gem_close {
+ 
+ static IOLock * gGPULock;                       /* around the clients' buffers */
+ static bool gGPUStuck;                          /* a wait of a second came to nothing: nothing is waited for again */
++static bool gGPUCleanAll;                       /* boot-arg sweetgpu_flushall=1: every buffer of a submission, every time */
++
++/*
++ * Cleaning a buffer out of the caches costs as much as it is long, whether or not anything in it
++ * changed, and CoreAnimation's frames name tens of MB of them (the screen's surface, the
++ * wallpaper's texture): cleaning them all took most of a frame. Small buffers (command streams,
++ * Mesa's upload buffers, written without telling anyone) are cleaned every time; a big one only
++ * when the program may have written it: new, asked about (CPU_PREP: our Mesa asks before every
++ * CPU access, tools/mesa/freedreno-darwin.patch), taken back from Mesa's cache (MADVISE), or,
++ * a surface's, its seed changed (somebody wrote it and unlocked it). After the GPU, the same:
++ * WAIT_FENCE invalidates the small ones, CPU_PREP a big one when it is about to be read.
++ */
++#define GPU_CLEAN_ALWAYS        (1024 * 1024)
++
++static uint32_t
++surface_seed(SweetSurface * s)
++{
++	return s != NULL && s->state != NULL ? *(volatile uint32_t *) ((uint8_t *) s->state->getBytesNoCopy() + 0xc) : 0;
++}
+ 
+ /* Wait for submission `fence`; with gGPULock held, which is let go of while waiting. */
+ static bool
+@@ -244,6 +263,11 @@ SweetGPU::start(IOService * provider)
+ 		return false;
+ 	}
+ 	gGPULock = IOLockAlloc();
++	{
++		uint32_t all = 0;
++
++		gGPUCleanAll = PE_parse_boot_argn("sweetgpu_flushall", &all, sizeof(all)) && all != 0;
++	}
+ 	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
+ 	setProperty("SweetGPUInterface", "msm");
+ 	registerService();
+@@ -266,6 +290,8 @@ struct gpu_buffer {
+ 	uint64_t                        size;
+ 	uint32_t                        flags;
+ 	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++	bool                            dirty;          /* the program may have written it since it was last cleaned */
++	uint32_t                        seed;           /* a surface's: its seed when it was last cleaned */
+ };
+ 
+ class SweetGPUUserClient : public IOUserClient
+@@ -278,6 +304,8 @@ class SweetGPUUserClient : public IOUserClient
+ 	uint32_t                fBufferCount;
+ 	uint64_t                fBufferBytes;
+ 	uint32_t                fSubmits;
++	uint64_t                fCleaned, fSkipped;     /* bytes of buffers cleaned before submissions, and not */
++	uint64_t                fCleanTime;             /* mach time spent cleaning them */
+ 	uint32_t                fSurfaces;
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
+@@ -425,6 +453,8 @@ SweetGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	b->size = size;
+ 	b->flags = request->flags;
+ 	b->fence = 0;
++	b->dirty = true;
++	b->seed = 0;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
+ 	IOLockUnlock(gGPULock);
+@@ -521,6 +551,8 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request * request)
+ 	b->size = size;
+ 	b->flags = 0;
+ 	b->fence = 0;
++	b->dirty = true;
++	b->seed = surface_seed(s);
+ 	fBufferCount++;
+ 	fBufferBytes += size;
+ 	if (fSurfaces++ < 8) {
+@@ -602,13 +634,24 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+ 		addresses[count] = b->address + cmds[i].submit_offset;
+ 		words[count++] = cmds[i].size / 4;
+ 	}
++	uint64_t cleaning = mach_absolute_time();
+ 	for (uint32_t i = 0; i < request->nr_bos; i++) {        /* what the program wrote, in memory for the GPU */
+ 		struct gpu_buffer * b = buffer(bos[i].handle);
+ 
+ 		if (b != NULL) {
+-			sweet_dcache_flush((vm_offset_t) b->kernel, (unsigned) b->size);
++			uint32_t seed = surface_seed(b->surface);
++
++			if (gGPUCleanAll || b->size <= GPU_CLEAN_ALWAYS || b->dirty || (b->surface != NULL && seed != b->seed)) {
++				sweet_dcache_flush((vm_offset_t) b->kernel, (unsigned) b->size);
++				b->dirty = false;
++				b->seed = seed;
++				fCleaned += b->size;
++			} else {
++				fSkipped += b->size;
++			}
+ 		}
+ 	}
++	fCleanTime += mach_absolute_time() - cleaning;
+ 	request->fence = sweet_a610_submit(addresses, words, count);
+ 	if (request->fence == 0) {
+ 		sweet_a610_report("SweetGPU: the ring is full");
+@@ -623,6 +666,13 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+ 			b->fence = request->fence;
+ 		}
+ 	}
++	if (fSubmits % 1000 == 999) {
++		uint64_t ns;
++
++		absolutetime_to_nanoseconds(fCleanTime, &ns);
++		IOLog("SweetGPU: %u submissions: %llu MB of buffers cleaned (%llu us a submission), %llu MB left as they were%s\n",
++		    fSubmits + 1, fCleaned >> 20, ns / 1000 / (fSubmits + 1), fSkipped >> 20, gGPUCleanAll ? " (sweetgpu_flushall=1)" : "");
++	}
+ 	if (fSubmits++ < 4 && count != 0) {
+ 		IOLog("SweetGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
+ 		    addresses[0], words[0]);
+@@ -719,6 +769,10 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			ret = kIOReturnBusy;
+ 		} else if (b != NULL && b->fence != 0) {
+ 			sweet_dcache_flush((vm_offset_t) b->kernel, (unsigned) b->size);       /* what the GPU wrote, for the program */
++			b->fence = 0;                           /* (done, and seen: not invalidated again at the next CPU_PREP) */
++		}
++		if (b != NULL) {
++			b->dirty = true;                        /* and the program is about to touch it */
+ 		}
+ 		IOLockUnlock(gGPULock);
+ 		break;
+@@ -733,14 +787,20 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		} else {
+ 			/* what the GPU wrote, for the program: the buffers whose last submission this was */
+ 			for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
+-				if (fBuffers[i].memory != NULL && fBuffers[i].fence == r.waitFence.fence) {
++				if (fBuffers[i].memory != NULL && fBuffers[i].fence == r.waitFence.fence &&
++				    (gGPUCleanAll || fBuffers[i].size <= GPU_CLEAN_ALWAYS)) {
+ 					sweet_dcache_flush((vm_offset_t) fBuffers[i].kernel, (unsigned) fBuffers[i].size);
+ 				}
+ 			}
+ 		}
+ 		IOLockUnlock(gGPULock);
+ 		break;
+-	case kMsmGemMadvise:
++	case kMsmGemMadvise:                            /* Mesa taking a buffer back from its cache, to be written anew */
++		IOLockLock(gGPULock);
++		if ((b = buffer(r.madvise.handle)) != NULL) {
++			b->dirty = true;
++		}
++		IOLockUnlock(gGPULock);
+ 		r.madvise.retained = 1;
+ 		break;
+ 	case kMsmSubmitQueueNew:
