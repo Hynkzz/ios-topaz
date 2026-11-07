@@ -116,6 +116,7 @@ buffer(uint32_t size, uint32_t *handle, uint64_t *address, uint32_t **memory)
 	mach_vm_size_t mapped = 0;
 	kern_return_t kr;
 
+	printf("GEM_NEW %u bytes ...\n", size);
 	if ((kr = call(kMsmGemNew, &made, sizeof(made))) != KERN_SUCCESS) {
 		printf("GEM_NEW %u bytes: %#x\n", size, kr);
 		return -1;
@@ -126,6 +127,7 @@ buffer(uint32_t size, uint32_t *handle, uint64_t *address, uint32_t **memory)
 		printf("GEM_INFO %u: %#x\n", made.handle, kr);
 		return -1;
 	}
+	printf("buffer %u at %#llx: mapping it here ...\n", made.handle, (unsigned long long)info.value);
 	if ((kr = IOConnectMapMemory64(gpu, made.handle, mach_task_self(), &at, &mapped, kIOMapAnywhere)) != KERN_SUCCESS) {
 		printf("map buffer %u: %#x\n", made.handle, kr);
 		return -1;
@@ -208,6 +210,7 @@ round_once(int round)
 	submit.nr_cmds = 1;
 	submit.bos = (uint64_t)(uintptr_t)bos;
 	submit.cmds = (uint64_t)(uintptr_t)&cmd;
+	printf("commands written (%u words): submitting ...\n", emitted);
 	clock_gettime(CLOCK_MONOTONIC_RAW, &began);
 	if ((kr = call(kMsmGemSubmit, &submit, sizeof(submit))) != KERN_SUCCESS) {
 		printf("GEM_SUBMIT: %#x\n", kr);
@@ -232,6 +235,7 @@ round_once(int round)
 	bad |= pic[0] != 0xffe09030 || pic[32 * 64 + 32] != 0xffe09030 || pic[64 * 64 - 1] != 0xffe09030;
 	IOConnectUnmapMemory64(gpu, pic_handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)pic);
 	IOConnectUnmapMemory64(gpu, cmd_handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)emit);
+	printf("giving the buffers back ...\n");
 	closing.handle = pic_handle;
 	kr = call(kDrmGemClose, &closing, sizeof(closing));
 	closing.handle = cmd_handle;
@@ -252,6 +256,7 @@ main(int argc, char **argv)
 	struct msm_submitqueue queue = { 0 };
 	kern_return_t kr;
 
+	setvbuf(stdout, NULL, _IONBF, 0);       /* every line out before a panic can take it */
 	if (service == IO_OBJECT_NULL) {
 		printf("no SweetGPU service (boot-arg sweetgpu=1 or 2 on ginkgo?)\n");
 		return 2;
