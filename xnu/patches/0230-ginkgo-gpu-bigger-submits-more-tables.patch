@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
+index b67e425..c1c2ead 100644
+--- a/bsd/dev/sweet_a610.c
++++ b/bsd/dev/sweet_a610.c
+@@ -223,7 +223,7 @@ extern uint64_t kvtophys(vm_offset_t va);
+ #define PTE_PAGE                3ull
+ #define PTE_CORE                (1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)  /* EL0, shared, AF, nG; MAIR 0 uncached */
+ #define PTE_ADDRESS             0x0000fffffffff000ull
+-#define SPACE_TABLES            64
++#define SPACE_TABLES            1024    /* 64 (~122 MB mapped) ran out under CoreAnimation: 2 GB */
+ #define SMMU_CB_TCR2            0x10
+ #define SMMU_CB_TTBR0           0x20
+ #define SMMU_CB_TTBR1           0x28
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 4a167ae..ffe4d42 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -159,7 +159,7 @@ struct drm_gem_close {
+ 
+ #define GPU_BUFFERS             4096            /* a client's, at most */
+ #define GPU_BUFFER_MAX          (128u << 20)
+-#define GPU_SUBMIT_CMDS         64
++#define GPU_SUBMIT_CMDS         512     /* CoreAnimation's frames came to 66+ (64 failed them, -EINVAL); 4 ring words each */
+ #define GPU_SUBMIT_BOS          4096
+ #define GPU_PATIENCE_MS         5000
+ #define GPU_ASK_AGAIN_US        200
+@@ -554,8 +554,8 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+ {
+ 	struct msm_gem_submit_bo * bos = NULL;
+ 	struct msm_gem_submit_cmd * cmds = NULL;
+-	uint64_t addresses[GPU_SUBMIT_CMDS];
+-	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
++	uint64_t * addresses = NULL;
++	uint32_t * words = NULL, count = 0;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+ 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
+@@ -564,7 +564,9 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+ 	}
+ 	bos = IONew(struct msm_gem_submit_bo, request->nr_bos);
+ 	cmds = IONew(struct msm_gem_submit_cmd, request->nr_cmds);
+-	if (bos == NULL || cmds == NULL) {
++	addresses = IONew(uint64_t, request->nr_cmds);          /* not on the stack: 512 of them */
++	words = IONew(uint32_t, request->nr_cmds);
++	if (bos == NULL || cmds == NULL || addresses == NULL || words == NULL) {
+ 		ret = kIOReturnNoMemory;
+ 		goto out;
+ 	}
+@@ -629,6 +631,12 @@ out:
+ 	if (cmds != NULL) {
+ 		IODelete(cmds, struct msm_gem_submit_cmd, request->nr_cmds);
+ 	}
++	if (addresses != NULL) {
++		IODelete(addresses, uint64_t, request->nr_cmds);
++	}
++	if (words != NULL) {
++		IODelete(words, uint32_t, request->nr_cmds);
++	}
+ 	return ret;
+ }
+ 
