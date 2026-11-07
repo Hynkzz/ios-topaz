@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2381546..557bc02 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -90,6 +90,22 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++extern "C" void sweet_dcache_flush(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c (0111): dc civac */
++
++/*
++ * ginkgo: rows of a surface the GPU drew, about to be read here, out of this processor's caches
++ * first. SweetGPU (0232) no longer pushes every buffer out of them when the GPU is done: what was
++ * cached of the surface's memory before (an earlier frame, read here; zeroes, when it was made)
++ * was copied to the panel instead of what the GPU had drawn -- a scroll that never settled.
++ */
++static void
++sweet_gpu_drawn_rows(SweetSurface *s, uintptr_t first, uint64_t length)
++{
++	if (s->gpuBumps != 0 && length != 0) {
++		sweet_dcache_flush((vm_offset_t)first, (unsigned)length);
++	}
++}
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -976,6 +992,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 				 * next frame in this surface at once, so scanning it directly let
+ 				 * the panel show frames half drawn. Cached to cached, a few ms.
+ 				 */
++				sweet_gpu_drawn_rows(s, va + s->offset + (uint64_t)oy * s->bytesPerRow, (uint64_t)fHeight * s->bytesPerRow);
+ 				if (fFlip[0] != NULL) {
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+ 					    s->bytesPerRow);
+@@ -1119,6 +1136,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			sweet_gpu_drawn_rows(s, src + s->offset + (uint64_t)sy * s->bytesPerRow, (uint64_t)h * s->bytesPerRow);
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
