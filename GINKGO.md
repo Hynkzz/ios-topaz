@@ -41,7 +41,9 @@ never in git or CI artifacts.
 | USB networking | ✅ | 0214, boot-args `sweetusb=2 sweethw=1`; phone 192.168.7.2, live log udp/5140 |
 | SSH | ✅ | dropbear from `dropbear.yml` with `tools/dropbear/sweet_pw.c`: libinfo user lookups fail on the port, so OpenSSH rejects every user |
 | CPU cores | 4 | `cpus=4`: the 16K-page kernel runs on the A73 cores only (A53 has no 16K granule — verify) |
-| GPU for the UI (Mesa) | ❌ | software rendering; kernel side done (0218-0226); next: Mesa freedreno over SweetGPU |
+| GPU speed | ✅ | 0227: RPM GLINK (the shim's channel), MX/CX votes, GPU PLL: 320 and 745 MHz measured by the GPU's own counter (`sysctl kern.sweetgpu_mhz=N`, boot-arg `sweetgpu_mhz=N`) |
+| Mesa (freedreno) | ✅ | 0227 + `mesa.yml`: Mesa 25.0.7 with willow's patches, `tools/gputest/gl_triangle` draws a triangle through FD610 (OpenGL ES 3.2). IOSurfaces become GPU buffers (request 0x7e) |
+| GPU for the UI (Mesa) | ❌ | software rendering; next: OpenGL ES inside backboardd (willow's eagl.c, offsets for 20H392) |
 | Wi-Fi, cellular, BT, audio, camera, sensors | ❌ | |
 
 ## Roadmap (in order)

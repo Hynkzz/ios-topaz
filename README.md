@@ -27,7 +27,7 @@ Detailed status, per-patch notes and the roadmap: [GINKGO.md](GINKGO.md).
 | Battery | Percentage from the PMI632 fuel gauge (voltage based); charging does not run under iOS yet |
 | USB networking + SSH | CDC-ECM gadget (`sweetusb=2 sweethw=1`): phone `192.168.7.2`, live kernel log on UDP 5140, Dropbear SSH (key only) |
 | `DYLD_*` / inserted libraries | The AMFI stand-in answers dyld's policy call |
-| GPU (Adreno 610) | **Bring-up only:** power, zap shader through TrustZone, command processor, the 2D engine draws on the panel (`sweetgpu=1`, `sysctl kern.sweetgpu=14`). The UI still renders in software |
+| GPU (Adreno 610) | Powered, zap shader through TrustZone, own SMMU page tables, the `SweetGPU` service (msm interface), up to 745 MHz. **Mesa freedreno draws** (`gl_triangle`, OpenGL ES 3.2). The UI still renders in software |
 
 ## What does not work
 
@@ -60,7 +60,7 @@ Detailed status, per-patch notes and the roadmap: [GINKGO.md](GINKGO.md).
 | `shim/console.h`, `shim/shim.c` | `-DGINKGO`: 2340-line screen, none of topaz's UFS/IMEM/PS_HOLD writes |
 | `tools/mkadt.py --ginkgo` | Apple device tree for the Note 8 (RAM, display, `sweet-sdhci` node) |
 | `tools/mkpayload.py` | Kernel + ADT payload; `--touchfw` and `--gpufw` add firmware images |
-| `xnu/patches/0200`–`0223` | ginkgo patches (eMMC, display, touch, USB, RTC, battery, AMFI, GPU); one line each in [GINKGO.md](GINKGO.md) |
+| `xnu/patches/0200`–`0227` | ginkgo patches (eMMC, display, touch, USB, RTC, battery, AMFI, GPU); one line each in [GINKGO.md](GINKGO.md) |
 | `.github/workflows/xnu.yml`, `dropbear.yml` | Kernel build (macOS runner) and the SSH server |
 
 ## Building
