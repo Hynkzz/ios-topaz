@@ -367,6 +367,7 @@ struct eagl {
 	} line;
 	/* a frame's worth */
 	unsigned calls, draws, triangles, uploads, clears, last_draws;
+	unsigned fresh_targets;         /* targets made empty, not filled (target_fresh) */
 	uint64_t upload_bytes, began, attaching, flushing;
 	/* everything so far */
 	unsigned frames, shaders, programs, errors, shared, refused;
@@ -4211,6 +4212,52 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	return YES;
 }
 
+/*
+ * ginkgo: a target whose surface nobody has written yet (the kernel's seed of a new surface is 1;
+ * writers move it). CoreAnimation makes a new screen-sized one for every frame here: filling the
+ * texture from it (a sum over its 11 MB, then a copy of them) took 15-30 ms a frame for nothing
+ * but zeros. The texture, which is bound, is made empty and cleared on the GPU instead.
+ */
+static bool
+target_fresh(struct eagl *e, struct image *image)
+{
+	GLint framebuffer = 0, scissor = 0;
+	GLfloat clear[4] = { 0, 0, 0, 0 };
+	GLboolean mask[4] = { 1, 1, 1, 1 };
+
+	if (image->wrapped || IOSurfaceGetSeed(image->surface) != 1) {
+		return false;
+	}
+	glTexImage2D(GL_TEXTURE_2D, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
+	    image->format, image->type, NULL);
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+	glGetIntegerv(GL_SCISSOR_TEST, &scissor);
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+	glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	glDisable(GL_SCISSOR_TEST);
+	glColorMask(1, 1, 1, 1);
+	glClearColor(0, 0, 0, 0);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)framebuffer);
+	glClearColor(clear[0], clear[1], clear[2], clear[3]);
+	glColorMask(mask[0], mask[1], mask[2], mask[3]);
+	if (scissor) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	image->seed = 1;
+	if (e->fresh_targets++ % 100 == 0) {
+		say("redwood-gl: %u targets made empty instead of filled from their new surfaces (surface %u, %d x %d)\n",
+		    e->fresh_targets, IOSurfaceGetID(image->surface), image->width, image->height);
+	}
+	return true;
+}
+
 /* (the "image" is the target, GL_TEXTURE_2D, and means the texture bound to it) */
 static BOOL
 my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface, BOOL inverted)
@@ -4262,7 +4309,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
 	 */
 	began = now_us();
-	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
+	if ((surface_mirrored(e, image) || !surface_shared(e, image)) && !target_fresh(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
