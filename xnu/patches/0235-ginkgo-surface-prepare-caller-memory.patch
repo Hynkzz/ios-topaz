@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index d563bcd..97a33ef 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -961,10 +961,20 @@ static IOReturn
+ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ {
+ 	if (args->structureOutputDescriptor != NULL) {
+-		if (len > args->structureOutputDescriptor->getLength()) {
++		/*
++		 * The caller's memory, not wired until prepared: writeBytes() looks up its pages
++		 * (IOGMD "not wired for the IODMACommand" panic, the first big IOSurfaceCopyValue reply).
++		 */
++		IOMemoryDescriptor *out = args->structureOutputDescriptor;
++		if (len > out->getLength()) {
+ 			return kIOReturnNoSpace;
+ 		}
+-		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		IOReturn ret = out->prepare();
++		if (ret != kIOReturnSuccess) {
++			return ret;
++		}
++		out->writeBytes(0, buf, len);
++		out->complete();
+ 		args->structureOutputDescriptorSize = len;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -1021,7 +1031,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		if (copy == NULL) {
+ 			return kIOReturnNoMemory;
+ 		}
++		if (args->structureInputDescriptor->prepare() != kIOReturnSuccess) {
++			IOFreeData(copy, len);
++			return kIOReturnVMError;
++		}
+ 		args->structureInputDescriptor->readBytes(0, copy, len);
++		args->structureInputDescriptor->complete();
+ 		buf = copy;
+ 	}
+ 	OSObject *obj = (buf != NULL && len > 0) ? OSUnserializeXML(buf, len) : NULL;
