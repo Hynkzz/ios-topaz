@@ -1,6 +1,6 @@
 --- a/src/freedreno/drm/freedreno_bo.c
 +++ b/src/freedreno/drm/freedreno_bo.c
-@@ -679,9 +679,32 @@
+@@ -679,9 +679,33 @@
     return false;
  }
  
@@ -18,7 +18,8 @@
 +{
 +   int ret = fd_bo_cpu_prep_waited(bo, pipe, op);
 +
-+   if (ret == 0 && (op & (FD_BO_PREP_READ | FD_BO_PREP_WRITE)))
++   /* (a piece of a heap block has no cpu_prep of its own; the kernel cleans the 4 MB blocks every time) */
++   if (ret == 0 && bo->funcs->cpu_prep && (op & (FD_BO_PREP_READ | FD_BO_PREP_WRITE)))
 +      bo->funcs->cpu_prep(bo, pipe, (op & (FD_BO_PREP_READ | FD_BO_PREP_WRITE)) | FD_BO_PREP_NOSYNC);
 +   return ret;
 +}

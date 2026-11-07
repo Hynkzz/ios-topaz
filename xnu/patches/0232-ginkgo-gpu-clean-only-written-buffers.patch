@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
-index 3184790..1d57953 100644
+index 3184790..dcf3409 100644
 --- a/iokit/Kernel/arm/SweetGPU.cpp
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
 @@ -167,6 +167,25 @@ struct drm_gem_close {
@@ -18,7 +18,7 @@ index 3184790..1d57953 100644
 + * a surface's, its seed changed (somebody wrote it and unlocked it). After the GPU, the same:
 + * WAIT_FENCE invalidates the small ones, CPU_PREP a big one when it is about to be read.
 + */
-+#define GPU_CLEAN_ALWAYS        (1024 * 1024)
++#define GPU_CLEAN_ALWAYS        (4 * 1024 * 1024)      /* Mesa's heap blocks (FD_BO_HEAP_BLOCK_SIZE) are 4 MB: never prepped */
 +
 +static uint32_t
 +surface_seed(SweetSurface * s)
