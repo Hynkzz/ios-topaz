@@ -10,6 +10,12 @@ on:
       drivers:
         description: gallium drivers
         default: softpipe,freedreno
+  push:
+    branches: [ginkgo-sd]
+    paths:
+      - "tools/mesa/**"
+      - "tools/mk-mesa.sh"
+      - ".github/workflows/mesa.yml"
 jobs:
   mesa:
     runs-on: ${{ inputs.runner || 'macos-15' }}
