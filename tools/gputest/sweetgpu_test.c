@@ -14,6 +14,7 @@
  * Usage: sweetgpu_test [rounds]   (default 1; exit 0 when every round passed)
  */
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -141,8 +142,84 @@ buffer(uint32_t size, uint32_t *handle, uint64_t *address, uint32_t **memory)
 	return 0;
 }
 
+/*
+ * An IOSurface as the picture (sweetgpu_test surface): 64 x 128 pixels of 32
+ * bits, rows of 256 bytes, so the picture and the words below it fit as in a
+ * buffer of ours. Its memory becomes a GPU buffer by request 0x7e (0227).
+ */
+#define kSweetSurface           0x7e
+#define SURFACE_DESCRIBE        0xffffffffu
+struct sweet_surface_request {
+	uint32_t surface, handle;
+	uint64_t size;
+	uint32_t offset, row_bytes, width, height, pixel_format, planes;
+};
+
+static IOSurfaceRef
+surface_make(void)
+{
+	int width = 64, height = 128, bpe = 4, row = 256;
+	uint32_t format = 'BGRA';
+	CFNumberRef w = CFNumberCreate(NULL, kCFNumberIntType, &width), h = CFNumberCreate(NULL, kCFNumberIntType, &height);
+	CFNumberRef e = CFNumberCreate(NULL, kCFNumberIntType, &bpe), r = CFNumberCreate(NULL, kCFNumberIntType, &row);
+	CFNumberRef f = CFNumberCreate(NULL, kCFNumberSInt32Type, &format);
+	const void *keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
+		kIOSurfacePixelFormat };
+	const void *values[] = { w, h, e, r, f };
+	CFDictionaryRef properties = CFDictionaryCreate(NULL, keys, values, 5, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef surface = IOSurfaceCreate(properties);
+
+	CFRelease(properties);
+	CFRelease(w);
+	CFRelease(h);
+	CFRelease(e);
+	CFRelease(r);
+	CFRelease(f);
+	return surface;
+}
+
+/* The surface as a GPU buffer: its handle and address; the picture is the surface's own memory. */
 static int
-round_once(int round)
+surface_buffer(IOSurfaceRef surface, uint32_t *handle, uint64_t *address, uint32_t **memory)
+{
+	struct sweet_surface_request request = { .surface = IOSurfaceGetID(surface), .handle = SURFACE_DESCRIBE };
+	struct msm_gem_info info = { 0 };
+	kern_return_t kr;
+
+	if ((kr = call(kSweetSurface, &request, sizeof(request))) != KERN_SUCCESS) {
+		printf("surface %u: describe: %#x\n", IOSurfaceGetID(surface), kr);
+		return -1;
+	}
+	printf("surface %u: %llu bytes, offset %u, %u bytes a row, %ux%u, format %#x, %u planes\n", request.surface,
+	    (unsigned long long)request.size, request.offset, request.row_bytes, request.width, request.height,
+	    request.pixel_format, request.planes);
+	if (request.row_bytes != PICTURE_ROW || request.offset != 0 || request.size < 2 * WRITTEN_AT) {
+		printf("surface %u: not laid out as this test needs\n", request.surface);
+		return -1;
+	}
+	request.handle = 0;
+	if ((kr = call(kSweetSurface, &request, sizeof(request))) != KERN_SUCCESS) {
+		printf("surface %u: as a buffer: %#x\n", request.surface, kr);
+		return -1;
+	}
+	info.handle = request.handle;
+	info.info = MSM_INFO_GET_IOVA;
+	if ((kr = call(kMsmGemInfo, &info, sizeof(info))) != KERN_SUCCESS) {
+		printf("GEM_INFO %u: %#x\n", request.handle, kr);
+		return -1;
+	}
+	IOSurfaceLock(surface, 0, NULL);
+	*handle = request.handle;
+	*address = info.value;
+	*memory = IOSurfaceGetBaseAddress(surface);
+	printf("surface %u is buffer %u at GPU address %#llx, here at %p\n", request.surface, request.handle,
+	    (unsigned long long)info.value, *memory);
+	return 0;
+}
+
+static int
+round_once(int round, IOSurfaceRef surface)
 {
 	uint32_t pic_handle, cmd_handle, *pic, fence;
 	uint64_t pic_at, cmd_at, ns;
@@ -155,7 +232,8 @@ round_once(int round)
 	kern_return_t kr;
 	int bad = 0;
 
-	if (buffer(PICTURE_SIZE, &pic_handle, &pic_at, &pic) || buffer(4096, &cmd_handle, &cmd_at, &emit)) {
+	if ((surface ? surface_buffer(surface, &pic_handle, &pic_at, &pic) : buffer(PICTURE_SIZE, &pic_handle, &pic_at, &pic)) ||
+	    buffer(4096, &cmd_handle, &cmd_at, &emit)) {
 		return 1;
 	}
 	emitted = 0;
@@ -238,7 +316,11 @@ round_once(int round)
 	printf("pixels: first %#x, middle %#x, last %#x (told 0xffe09030)\n", pic[0], pic[32 * 64 + 32], pic[64 * 64 - 1]);
 	bad |= pic[WRITTEN_AT / 4] != 0x600dc0de || pic[WRITTEN_AT / 4 + 2] != (uint32_t)round;
 	bad |= pic[0] != 0xffe09030 || pic[32 * 64 + 32] != 0xffe09030 || pic[64 * 64 - 1] != 0xffe09030;
-	IOConnectUnmapMemory64(gpu, pic_handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)pic);
+	if (surface) {
+		IOSurfaceUnlock(surface, 0, NULL);
+	} else {
+		IOConnectUnmapMemory64(gpu, pic_handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)pic);
+	}
 	IOConnectUnmapMemory64(gpu, cmd_handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)emit);
 	printf("giving the buffers back ...\n");
 	closing.handle = pic_handle;
@@ -255,7 +337,9 @@ round_once(int round)
 int
 main(int argc, char **argv)
 {
-	int rounds = argc > 1 ? atoi(argv[1]) : 1, failed = 0;
+	int surfaces = argc > 1 && strcmp(argv[1], "surface") == 0;
+	int rounds = argc > 1 + surfaces ? atoi(argv[1 + surfaces]) : 1, failed = 0;
+	IOSurfaceRef surface = NULL;
 	io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("SweetGPU"));
 	struct msm_param param = { .pipe = 1 };
 	struct msm_submitqueue queue = { 0 };
@@ -278,13 +362,20 @@ main(int argc, char **argv)
 	}
 	kr = call(kMsmSubmitQueueNew, &queue, sizeof(queue));
 	printf("SUBMITQUEUE_NEW: %#x -> %u\n", kr, queue.id);
+	if (surfaces && (surface = surface_make()) == NULL) {
+		printf("IOSurfaceCreate: none\n");
+		return 2;
+	}
 	for (int i = 1; i <= rounds; i++) {
-		int bad = round_once(i);
+		int bad = round_once(i, surface);
 
 		printf("round %d: %s\n", i, bad ? "FAILED" : "passed");
 		failed += bad;
 	}
 	IOServiceClose(gpu);
+	if (surface) {
+		CFRelease(surface);
+	}
 	printf(failed ? "SWEETGPU TEST FAILED (%d of %d rounds)\n" : "SWEETGPU TEST PASSED (%d failed of %d rounds)\n", failed, rounds);
 	return failed ? 1 : 0;
 }
