@@ -1,0 +1,650 @@
+diff --git a/bsd/dev/sweet_a610.c b/bsd/dev/sweet_a610.c
+index 77a946e..b67e425 100644
+--- a/bsd/dev/sweet_a610.c
++++ b/bsd/dev/sweet_a610.c
+@@ -1579,10 +1579,369 @@ a610_keep(bool panel)
+ 	gpu_free[0].size = GPU_ADDRESSES_SIZE;
+ 	gpu_free_count = 1;
+ 	kept = true;
+-	printf("SWEET A610: THE GPU STAYS ON (19.2 MHz) for the system to draw with\n");
++	printf("SWEET A610: THE GPU STAYS ON (19.2 MHz until kern.sweetgpu_mhz) for the system to draw with\n");
+ 	return kept_selftest(panel) ? 15 : -15;
+ }
+ 
++/*
++ * The RPM, SM6125's keeper of shared rails and clocks (RPM, not RPMh), as
++ * willow-hackios's bsd/dev/redwood_rpm.c (APSL 2.0) asks it: GLINK over two
++ * FIFOs in its message RAM, "ap2r" to it and "r2ap" from it, named in a table
++ * of contents ("grt0") in the RAM's last 256 bytes; rung through the APCS IPC
++ * register. ginkgo's ABL leaves no session behind, and the shim opens
++ * "rpm_requests" every boot for the microSD's supplies (shim/sdhci.c,
++ * rpm_open): its OPEN is in the FIFO's history, which is where our channel
++ * number comes from. A request: service "req", an id, the active set, a
++ * resource type and number, key-values. The RPM keeps the highest of what
++ * every processor asks for a rail, so a vote raises and never lowers.
++ * Layouts: Linux qcom_glink_rpm.c, qcom_glink_native.c, smd-rpm.c.
++ */
++#define RPM_RAM_PHYS            0x045f0000UL
++#define RPM_RAM_SIZE            0x7000UL
++#define RPM_TOC_MAGIC           0x67727430      /* "grt0" */
++#define RPM_FIFO_AP2R           0x61703272      /* "ap2r" */
++#define RPM_FIFO_R2AP           0x72326170      /* "r2ap" */
++#define RPM_IPC_PHYS            0x0f111000UL
++#define RPM_IPC_DOORBELL        8
++#define GLINK_OPEN              2
++#define GLINK_CLOSE             3
++#define GLINK_INTENT            5
++#define GLINK_TX_DATA           9
++#define RPM_REQUEST             0x00716572      /* "req" */
++#define RPM_MSG                 0x2367736d      /* "msg#" */
++#define RPM_ERR                 0x00727265      /* "err" */
++#define RPM_RAIL_CX             0x78637772      /* "rwcx" */
++#define RPM_RAIL_MX             0x786d7772      /* "rwmx" */
++#define RPM_KEY_LEVEL           0x6c766c76      /* "vlvl" */
++
++static vm_offset_t rpm_ram, rpm_ipc;
++static uint32_t rpm_tx_off, rpm_tx_size, rpm_rx_off, rpm_rx_size, rpm_next_id = 0x7a00;
++static int rpm_lcid = -1;
++
++/* The FIFOs and our "rpm_requests" channel, from what was sent since boot. Reads only. */
++static bool
++rpm_find(void)
++{
++	uint32_t toc = RPM_RAM_SIZE - 256, n, head, at = 0, data, sent = 0;
++	int lcid = -1;
++
++	if (rpm_lcid >= 0) {
++		return true;
++	}
++	if (rpm_ram == 0) {
++		rpm_ram = ml_io_map(RPM_RAM_PHYS, RPM_RAM_SIZE);
++	}
++	n = rd(rpm_ram + toc + 4);
++	if (rd(rpm_ram + toc) != RPM_TOC_MAGIC || n > 20) {
++		printf("SWEET RPM: no table of contents (%#x, %u entries)\n", rd(rpm_ram + toc), n);
++		return false;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t id = rd(rpm_ram + toc + 8 + 12 * i), off = rd(rpm_ram + toc + 12 + 12 * i);
++		uint32_t size = rd(rpm_ram + toc + 16 + 12 * i);
++
++		if (off + size > RPM_RAM_SIZE) {
++			continue;
++		}
++		if (id == RPM_FIFO_AP2R) {
++			rpm_tx_off = off;
++			rpm_tx_size = size;
++		} else if (id == RPM_FIFO_R2AP) {
++			rpm_rx_off = off;
++			rpm_rx_size = size;
++		}
++	}
++	if (rpm_tx_size == 0 || rpm_rx_size == 0) {
++		printf("SWEET RPM: the table names no ap2r/r2ap\n");
++		return false;
++	}
++	head = rd(rpm_ram + rpm_tx_off + 4);
++	data = rpm_tx_off + 8;
++	while (at + 8 <= head && head <= rpm_tx_size) {
++		uint32_t w0 = rd(rpm_ram + data + at), cmd = w0 & 0xffff, p1 = w0 >> 16, len = 8;
++
++		if (cmd == GLINK_OPEN) {
++			uint32_t name = rd(rpm_ram + data + at + 4) & 0xffff;
++
++			if (name >= 12 && rd(rpm_ram + data + at + 8) == 0x5f6d7072 &&         /* "rpm_" */
++			    rd(rpm_ram + data + at + 12) == 0x75716572) {                     /* "requ" */
++				lcid = (int)p1;
++			}
++			len = 8 + ((name + 7) & ~7u);
++		} else if (cmd == GLINK_TX_DATA) {
++			len = 16 + ((rd(rpm_ram + data + at + 8) + 7) & ~7u);
++			sent++;
++		} else if (cmd == GLINK_CLOSE && (int)p1 == lcid) {
++			lcid = -1;
++		} else if (cmd == GLINK_INTENT) {
++			len = 8 + 8 * rd(rpm_ram + data + at + 4);
++		} else if (cmd > 14) {
++			break;
++		}
++		at += len;
++	}
++	printf("SWEET RPM: ap2r at %#x (%u bytes, tail %u head %u), r2ap at %#x (tail %u head %u); "
++	    "rpm_requests is channel %d, %u requests sent before\n", rpm_tx_off, rpm_tx_size, rd(rpm_ram + rpm_tx_off), head,
++	    rpm_rx_off, rd(rpm_ram + rpm_rx_off), rd(rpm_ram + rpm_rx_off + 4), lcid, sent);
++	if (lcid < 0) {
++		printf("SWEET RPM: no open rpm_requests channel (the shim opens it for the microSD): nothing asked\n");
++		return false;
++	}
++	rpm_lcid = lcid;
++	return true;
++}
++
++/* One key-value for resource `type` `id`, active set; true when the RPM answered without "err". */
++static bool
++rpm_ask(const char *what, uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	uint32_t m[14], tail, head, room, n, w[12];
++
++	if (!rpm_find()) {
++		return false;
++	}
++	if (rpm_ipc == 0) {
++		rpm_ipc = ml_io_map(RPM_IPC_PHYS, 0x1000);
++	}
++	m[0] = GLINK_TX_DATA | (uint32_t)rpm_lcid << 16;
++	m[1] = 0;                               /* the RPM's GLINK is intentless */
++	m[2] = 40;
++	m[3] = 0;
++	m[4] = RPM_REQUEST;
++	m[5] = 20 + 12;
++	m[6] = rpm_next_id++;
++	m[7] = 0;                               /* active set */
++	m[8] = type;
++	m[9] = id;
++	m[10] = 12;
++	m[11] = key;
++	m[12] = 4;
++	m[13] = value;
++	printf("SWEET RPM: next: %s = %u (message %#x)\n", what, value, m[6]);
++
++	/* what is in the FIFO from it now is not our answer */
++	wr(rpm_ram + rpm_rx_off, rd(rpm_ram + rpm_rx_off + 4));
++	tail = rd(rpm_ram + rpm_tx_off);
++	head = rd(rpm_ram + rpm_tx_off + 4);
++	room = tail <= head ? rpm_tx_size - head + tail : tail - head;
++	if (sizeof(m) + 8 > room || head >= rpm_tx_size || (head & 7)) {
++		printf("SWEET RPM: no room to the RPM (tail %u, head %u)\n", tail, head);
++		return false;
++	}
++	for (uint32_t i = 0; i < 14; i++) {
++		wr(rpm_ram + rpm_tx_off + 8 + head, m[i]);
++		head = (head + 4) % rpm_tx_size;
++	}
++	wr(rpm_ram + rpm_tx_off + 4, head);
++	wr(rpm_ipc + RPM_IPC_DOORBELL, 1);
++
++	for (int i = 0; i < 2000 && rd(rpm_ram + rpm_rx_off + 4) == rd(rpm_ram + rpm_rx_off); i++) {
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	delay_for_interval(2, NSEC_PER_MSEC);   /* the rest of an answer still being written */
++	tail = rd(rpm_ram + rpm_rx_off);
++	head = rd(rpm_ram + rpm_rx_off + 4);
++	n = head >= tail ? head - tail : rpm_rx_size - tail + head;
++	if (n == 0) {
++		printf("SWEET RPM: %s: no answer in 200 ms\n", what);
++		return false;
++	}
++	for (uint32_t i = 0; i < 12; i++) {
++		w[i] = 4 * i < n ? rd(rpm_ram + rpm_rx_off + 8 + (tail + 4 * i) % rpm_rx_size) : 0;
++	}
++	wr(rpm_ram + rpm_rx_off, head);         /* taken */
++	printf("SWEET RPM: answer, %u bytes: %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x\n", n, w[0], w[1], w[2], w[3],
++	    w[4], w[5], w[6], w[7], w[8], w[9]);
++	if ((w[0] & 0xffff) != GLINK_TX_DATA || w[6] != RPM_MSG || w[8] != m[6]) {
++		printf("SWEET RPM: %s: not the answer to it\n", what);
++		return false;
++	}
++	if (w[9] == RPM_ERR) {
++		printf("SWEET RPM: %s: REFUSED\n", what);
++		return false;
++	}
++	return true;
++}
++
++/*
++ * The 3D core's speed (willow's a610_mhz, core_speed()): one of gpucc-trinket.c's
++ * speeds from one of the GPU's two alpha PLLs at twice the speed, its aux2
++ * output, the source dividing by 2; PLL1 (VCO 500 MHz-1 GHz) for 320 and 465,
++ * PLL0 (1-2 GHz) above. The rails MX (for the PLL) and CX (for the core) first,
++ * at the table's level and NOM at least: a lower vote than the firmware's own
++ * would mean nothing anyway (the RPM keeps the highest), and NOM is what
++ * every speed here has been run at on willow. Here the GPU is already kept
++ * on and running from the crystal: the core must be idle, and the source is
++ * switched under it the way clk_rcg2 does a rate change (forced on, new
++ * configuration, update). 19 goes back to the crystal and the PLL off.
++ * Returns the speed it now runs at (19 for the crystal), or 0 if nothing changed.
++ */
++#define PLL_MODE                0x00
++#define PLL_L                   0x04
++#define PLL_ALPHA               0x08
++#define PLL_ALPHA_U             0x0c
++#define PLL_USER                0x10
++#define PLL_CONFIG              0x18
++#define PLL_OUTCTRL             (1u << 0)
++#define PLL_BYPASSNL            (1u << 1)
++#define PLL_RESET_N             (1u << 2)
++#define PLL_LOCK_DET            (1u << 31)
++#define PLL_AUX2                (1u << 2)
++#define PLL_ALPHA_EN            (1u << 24)
++#define PLL_CONFIG_VALUE        0x4001055b      /* gpu_pll0_config's and gpu_pll1_config's */
++#define GX_RCG_CMD              0x101c
++#define GX_RCG_CFG              0x1020
++#define RCG_UPDATE              (1u << 0)
++#define RCG_ROOT_EN             (1u << 1)
++#define RCG_ROOT_OFF            (1u << 31)
++#define LEVEL_NOM               256
++#define RBBM_PERFCTR_CP_0       GPU_WORD(0x0400)
++
++static const struct {
++	uint32_t mhz, level;
++} core_speeds[] = {
++	{ 320, 64 }, { 465, 128 }, { 600, 192 }, { 745, 256 }, { 820, 320 }, { 900, 384 }, { 950, 416 },
++};
++static uint32_t core_mhz;               /* 0: the crystal's 19.2 */
++static int core_pll = -1;               /* the PLL of ours the core runs from */
++
++/* The 3D core's clock source to input `source`, divided by `half_steps` (cfg's divider field) */
++static bool
++core_source(uint32_t source, uint32_t divider)
++{
++	int i;
++
++	wr(gpucc + GX_RCG_CMD, rd(gpucc + GX_RCG_CMD) | RCG_ROOT_EN);
++	for (i = 0; i < 100 && (rd(gpucc + GX_RCG_CMD) & RCG_ROOT_OFF); i++) {
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	wr(gpucc + GX_RCG_CFG, (rd(gpucc + GX_RCG_CFG) & ~0x71fu) | source << 8 | divider);
++	wr(gpucc + GX_RCG_CMD, rd(gpucc + GX_RCG_CMD) | RCG_UPDATE);
++	for (i = 0; i < 500 && (rd(gpucc + GX_RCG_CMD) & RCG_UPDATE); i++) {
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	wr(gpucc + GX_RCG_CMD, rd(gpucc + GX_RCG_CMD) & ~RCG_ROOT_EN);
++	printf("SWEET A610: the 3D core's clock source: command %#x, configuration %#x (%s)\n", rd(gpucc + GX_RCG_CMD),
++	    rd(gpucc + GX_RCG_CFG), rd(gpucc + GX_RCG_CMD) & RCG_UPDATE ? "the switch DID NOT TAKE" : "switched");
++	return !(rd(gpucc + GX_RCG_CMD) & RCG_UPDATE);
++}
++
++/* The core's speed by its own counter (CP perfcounter 0 counts every cycle since step 11), over 20 ms. */
++static uint32_t
++core_measured(void)
++{
++	uint64_t c0, c1, t0, t1, ns;
++
++	c0 = rd(gpu + RBBM_PERFCTR_CP_0) | (uint64_t)rd(gpu + RBBM_PERFCTR_CP_0 + 4) << 32;
++	t0 = mach_absolute_time();
++	delay_for_interval(20, NSEC_PER_MSEC);
++	c1 = rd(gpu + RBBM_PERFCTR_CP_0) | (uint64_t)rd(gpu + RBBM_PERFCTR_CP_0 + 4) << 32;
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	printf("SWEET A610: THE CORE'S SPEED by its own counter: %llu cycles in %llu us = %llu MHz\n", c1 - c0, ns / 1000,
++	    ns ? (c1 - c0) * 1000 / ns : 0);
++	return ns ? (uint32_t)((c1 - c0) * 1000 / ns) : 0;
++}
++
++static uint32_t
++a610_speed(uint32_t mhz)
++{
++	uint32_t level = 0, pll, source, l;
++	uint64_t fraction;
++	vm_offset_t p;
++	int i;
++
++	if (!kept) {
++		printf("SWEET A610: the speed is set on the GPU kept on (step 15) only\n");
++		return 0;
++	}
++	for (i = 0; i < 1000 && !kept_done(kept_fence); i++) {
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	if (!kept_done(kept_fence)) {
++		printf("SWEET A610: the core is not idle (submission %u): speed not changed\n", kept_fence);
++		return 0;
++	}
++	if (mhz == 1) {
++		printf("SWEET A610: speed: the RPM's channel only, nothing asked\n");
++		(void)rpm_find();
++		core_measured();
++		return 1;
++	}
++	if (core_pll >= 0 || mhz == 19) {
++		/* back to the crystal first: a PLL is not reprogrammed under a core that runs from it */
++		if (!core_source(0, 0)) {
++			return 0;
++		}
++		if (core_pll >= 0) {
++			wr(gpucc + 0x100 * core_pll + PLL_MODE, 0);
++			printf("SWEET A610: PLL%d off\n", core_pll);
++		}
++		core_pll = -1;
++		core_mhz = 0;
++		if (mhz == 19) {
++			core_measured();
++			return 19;
++		}
++	}
++	for (unsigned k = 0; k < sizeof(core_speeds) / sizeof(core_speeds[0]); k++) {
++		if (core_speeds[k].mhz == mhz) {
++			level = core_speeds[k].level;
++		}
++	}
++	if (level == 0) {
++		printf("SWEET A610: %u MHz is not one of 19 320 465 600 745 820 900 950\n", mhz);
++		return 0;
++	}
++	if (level < LEVEL_NOM) {
++		level = LEVEL_NOM;
++	}
++	pll = 2 * mhz >= 1000 ? 0 : 1;
++	source = pll == 0 ? 2 : 4;              /* gpu_cc_parent_map_1 */
++	l = 20 * mhz / 192;                     /* twice the speed over 19.2 MHz: L, and 40 bits of fraction */
++	fraction = ((uint64_t)(20 * mhz % 192) << 40) / 192;
++	p = gpucc + 0x100 * pll;
++	printf("SWEET A610: next: the core at %u MHz: rails MX and CX at level %u, PLL%u at %u MHz (L %#x, alpha %#llx), "
++	    "source input %u divided by 2\n", mhz, level, pll, 2 * mhz, l, fraction, source);
++	if (!rpm_ask("the rail MX", RPM_RAIL_MX, 0, RPM_KEY_LEVEL, level) ||
++	    !rpm_ask("the rail CX", RPM_RAIL_CX, 0, RPM_KEY_LEVEL, level)) {
++		printf("SWEET A610: the RPM has not given the rails: the core stays on the crystal\n");
++		return 0;
++	}
++	if (rd(p + PLL_MODE) & PLL_OUTCTRL) {
++		printf("SWEET A610: PLL%u is already running (mode %#x): not touched\n", pll, rd(p + PLL_MODE));
++		return 0;
++	}
++	wr(p + PLL_L, l);
++	wr(p + PLL_ALPHA, (uint32_t)fraction);
++	wr(p + PLL_ALPHA_U, (uint32_t)(fraction >> 32));
++	wr(p + PLL_CONFIG, PLL_CONFIG_VALUE);
++	wr(p + PLL_USER, (rd(p + PLL_USER) & ~(3u << 20)) | (pll == 0 ? 0u : 2u) << 20 | PLL_ALPHA_EN | PLL_AUX2);
++	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_BYPASSNL);
++	delay_for_interval(5, NSEC_PER_USEC);
++	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_RESET_N);
++	for (i = 0; i < 200 && !(rd(p + PLL_MODE) & PLL_LOCK_DET); i++) {
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	if (!(rd(p + PLL_MODE) & PLL_LOCK_DET)) {
++		printf("SWEET A610: PLL%u DOES NOT LOCK in 2 ms (mode %#x): off again\n", pll, rd(p + PLL_MODE));
++		wr(p + PLL_MODE, 0);
++		return 0;
++	}
++	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_OUTCTRL);
++	printf("SWEET A610: PLL%u locked after %d us (mode %#x)\n", pll, 10 * i, rd(p + PLL_MODE));
++	core_pll = (int)pll;
++	if (!core_source(source, 2 * 2 - 1)) {
++		(void)core_source(0, 0);
++		wr(p + PLL_MODE, 0);
++		core_pll = -1;
++		return 0;
++	}
++	core_mhz = mhz;
++	core_measured();
++	return mhz;
++}
++
+ /* boot-arg sweetgpu=2: the service SweetGPU (iokit/Kernel/arm/SweetGPU.cpp) has the GPU kept on, without the panel band. */
+ int sweet_a610_autostart(void);
+ 
+@@ -1592,6 +1951,13 @@ sweet_a610_autostart(void)
+ 	lck_mtx_lock(&a610_lock);
+ 	a610_done = a610_keep(false);
+ 	printf("SWEET A610: result %d\n", a610_done);
++	{
++		uint32_t mhz = 0;
++
++		if (a610_done == 15 && PE_parse_boot_argn("sweetgpu_mhz", &mhz, sizeof(mhz)) && mhz != 0) {
++			a610_speed(mhz);
++		}
++	}
+ 	lck_mtx_unlock(&a610_lock);
+ 	return a610_done;
+ }
+@@ -1637,8 +2003,8 @@ sweet_a610_parameter(uint32_t which, uint64_t *value)
+ 	case 0x03:                              /* CHIP_ID */
+ 		*value = GPU_CHIP_ID_A610;
+ 		return true;
+-	case 0x04:                              /* MAX_FREQ: the core runs from the crystal */
+-		*value = 19200000;
++	case 0x04:                              /* MAX_FREQ: the crystal's, or the speed set (kern.sweetgpu_mhz) */
++		*value = core_mhz ? (uint64_t)core_mhz * 1000000 : 19200000;
+ 		return true;
+ 	case 0x05:                              /* TIMESTAMP */
+ 		*value = mach_absolute_time();
+@@ -1793,6 +2159,40 @@ sysctl_sweetgpu SYSCTL_HANDLER_ARGS
+ 	return 0;
+ }
+ 
++/*
++ * kern.sweetgpu_mhz=N (boot-arg sweetgpu=1 or 2, the GPU kept on): the core's
++ * speed, 320 465 600 745 820 900 950 MHz from a PLL with the RPM's rails, 19
++ * the crystal again, 1 only finds the RPM's channel and measures (no writes).
++ * Reading gives the speed set (19: the crystal). Boot-arg sweetgpu_mhz=N sets
++ * it right after sweetgpu=2's start.
++ */
++static int
++sysctl_sweetgpu_mhz SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = core_mhz ? (int)core_mhz : 19, enabled = 0, error;
++	DTEntry node;
++
++	error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (!PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled)) || (enabled != 1 && enabled != 2) ||
++	    SecureDTLookupEntry(NULL, "/sweet-sdhci", &node) != kSuccess) {
++		return EPERM;
++	}
++	if (value < 1) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&a610_lock);
++	value = (int)a610_speed((uint32_t)value);
++	lck_mtx_unlock(&a610_lock);
++	return value == 0 ? EIO : 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweetgpu_mhz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweetgpu_mhz, "I", "ginkgo Adreno 610 core speed in MHz (boot-arg sweetgpu=1 or 2)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweetgpu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     NULL, 0, sysctl_sweetgpu, "I", "ginkgo Adreno 610 bring-up steps (boot-arg sweetgpu=1)");
+ 
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 85727d5..4a167ae 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -21,8 +21,14 @@
+  * page's address. So the buffers a submission names are cleaned and
+  * invalidated out of this processor's caches before the GPU is told, and a
+  * buffer again when a wait for it (CPU_PREP, WAIT_FENCE) has seen the GPU
+- * done, before the program reads what the GPU wrote. Not here yet (willow
+- * has them): IOSurfaces as buffers, kept buffers, recovery of a hung core,
++ * done, before the program reads what the GPU wrote.
++ *
++ * One request is not Linux's (willow's kRedwoodSurface, 0x7e, which Mesa's
++ * redwood-drm sends): an IOSurface's memory as a buffer, so that what the GPU
++ * draws is in the surface the window server hands to the display, with
++ * nothing copied. The surface (SweetSurface.h) is held while the buffer is
++ * there; asked with handle 0xffffffff the request only describes it.
++ * Not here yet (willow has them): kept buffers, recovery of a hung core,
+  * interrupts (waiting asks again every 200 us).
+  */
+ #include <IOKit/IOLib.h>
+@@ -40,6 +46,8 @@
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+ 
++#include "SweetSurface.h"
++
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+ extern "C" {
+@@ -73,6 +81,15 @@ enum {
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kSweetSurface           = 0x7e,         /* ours (willow's): an IOSurface's memory as a buffer */
++};
++#define kSweetSurfaceDescribe   0xffffffffu     /* ... only what the buffer would be like */
++
++/* tools/mesa/redwood-drm/xf86drm.h, struct redwood_drm_surface */
++struct sweet_surface_request {
++	uint32_t surface, handle;
++	uint64_t size;
++	uint32_t offset, row_bytes, width, height, pixel_format, planes;
+ };
+ 
+ struct msm_timespec {
+@@ -242,7 +259,8 @@ SweetGPU::start(IOService * provider)
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ struct gpu_buffer {
+-	IOBufferMemoryDescriptor *      memory;         /* NULL: this handle is free */
++	IOMemoryDescriptor *            memory;         /* NULL: this handle is free */
++	SweetSurface *                  surface;        /* whose memory it is, when not its own */
+ 	uint8_t *                       kernel;         /* where it is in the kernel */
+ 	uint64_t                        address;        /* the GPU's for it */
+ 	uint64_t                        size;
+@@ -260,11 +278,13 @@ class SweetGPUUserClient : public IOUserClient
+ 	uint32_t                fBufferCount;
+ 	uint64_t                fBufferBytes;
+ 	uint32_t                fSubmits;
++	uint32_t                fSurfaces;
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
+ 	void freeBuffer(struct gpu_buffer * b);
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
++	IOReturn surfaceBuffer(struct sweet_surface_request * request);
+ 	IOReturn submit(struct msm_gem_submit * request);
+ 
+ public:
+@@ -302,8 +322,10 @@ SweetGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		sweet_a610_unmap(b->address, b->size);
+ 		sweet_a610_address_free(b->address, b->size);
+ 		b->memory->release();
++		OSSafeReleaseNULL(b->surface);
+ 	}
+ 	b->memory = NULL;
++	b->surface = NULL;
+ 	fBufferCount--;
+ 	fBufferBytes -= b->size;
+ }
+@@ -396,6 +418,7 @@ SweetGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	b->memory = memory;
++	b->surface = NULL;
+ 	b->kernel = (uint8_t *) memory->getBytesNoCopy();
+ 	sweet_dcache_flush((vm_offset_t) b->kernel, (unsigned) size);  /* the zeroes in memory, where the GPU reads */
+ 	b->address = address;
+@@ -408,6 +431,101 @@ SweetGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * An IOSurface's memory as a buffer, as willow's surfaceBuffer(): the whole of
++ * its pixel memory (SweetSurface's buffer, its contiguous scanout memory, or
++ * the panel's), entered page by page like a buffer of ours. A surface that is
++ * already one of this client's buffers is that buffer again, as with Linux's
++ * handles.
++ */
++IOReturn
++SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request * request)
++{
++	SweetSurface * s = sweet_surface_copy(request->surface);
++	struct gpu_buffer * b = NULL;
++	uint64_t size, address = 0;
++	uint8_t * kernel;
++	bool mapped = true;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	size = s->memory != NULL ? (s->memory->getLength() + 4095) & ~4095ull : 0;
++	if (size == 0 || size > GPU_BUFFER_MAX || (kernel = (uint8_t *) s->kernelAddress()) == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	request->size = size;
++	request->offset = s->offset;
++	request->row_bytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixel_format = s->pixelFormat;
++	request->planes = s->planeCount;
++	if (request->handle == kSweetSurfaceDescribe) {
++		request->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++
++	IOLockLock(gGPULock);
++	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			request->handle = i + 1;
++			IOLockUnlock(gGPULock);
++			s->release();
++			return kIOReturnSuccess;
++		}
++	}
++	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL || (address = sweet_a610_address(size)) == 0) {
++		IOLockUnlock(gGPULock);
++		IOLog("SweetGPU: no %s left for surface %u (%llu bytes)\n", b ? "addresses" : "handles", request->surface, size);
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = s->memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && sweet_a610_map(address + offset, phys, false);
++	}
++	sweet_a610_mapped();
++	if (!mapped) {
++		sweet_a610_unmap(address, size);
++		sweet_a610_address_free(address, size);
++		IOLockUnlock(gGPULock);
++		IOLog("SweetGPU: surface %u (%llu bytes) cannot be entered into the GPU's address space\n", request->surface, size);
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	s->memory->retain();
++	b->memory = s->memory;
++	b->surface = s;                                         /* our retain of it */
++	b->kernel = kernel;
++	b->address = address;
++	b->size = size;
++	b->flags = 0;
++	b->fence = 0;
++	fBufferCount++;
++	fBufferBytes += size;
++	if (fSurfaces++ < 8) {
++		IOLog("SweetGPU: surface %u (%ux%u, %u bytes a row, format %#x) is buffer %u at %#llx\n", request->surface,
++		    s->width, s->height, s->bytesPerRow, s->pixelFormat, request->handle, address);
++	}
++	IOLockUnlock(gGPULock);
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ SweetGPUUserClient::gemInfo(struct msm_gem_info * request)
+ {
+@@ -548,6 +666,7 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		struct msm_submitqueue queue;
+ 		struct msm_submitqueue_query query;
+ 		struct drm_gem_close close;
++		struct sweet_surface_request surface;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	struct gpu_buffer * b;
+@@ -619,6 +738,9 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			copyout(&zero, (user_addr_t) r.query.data, sizeof(zero));
+ 		}
+ 		break;
++	case kSweetSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
+ 	case kDrmGemClose:
+ 		IOLockLock(gGPULock);
+ 		b = buffer(r.close.handle);
