@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index c389161..85727d5 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -13,9 +13,15 @@
+  * kept on by itself some seconds after it starts; with sweetgpu=1 it waits
+  * for `sysctl kern.sweetgpu=15`. Until then clients are refused.
+  *
+- * A buffer is wired kernel memory, write-combined, entered page by page into
+- * SMMU context 0 at an address from sweet_a610_address(); a buffer given back
+- * while the GPU may still be at it is waited for first. Not here yet (willow
++ * A buffer is wired kernel memory, entered page by page into SMMU context 0
++ * at an address from sweet_a610_address(); a buffer given back while the GPU
++ * may still be at it is waited for first. The memory is ordinary, cached
++ * (willow's gpu_cached=1): write-combined buffers (kIOMapWriteCombineCache)
++ * panicked this 16K-page kernel in phystokv_range with a quarter of the
++ * page's address. So the buffers a submission names are cleaned and
++ * invalidated out of this processor's caches before the GPU is told, and a
++ * buffer again when a wait for it (CPU_PREP, WAIT_FENCE) has seen the GPU
++ * done, before the program reads what the GPU wrote. Not here yet (willow
+  * has them): IOSurfaces as buffers, kept buffers, recovery of a hung core,
+  * interrupts (waiting asks again every 200 us).
+  */
+@@ -49,6 +55,7 @@ bool sweet_a610_done(uint32_t fence);
+ uint32_t sweet_a610_last(void);
+ void sweet_a610_report(const char *why);
+ int sweet_a610_autostart(void);
++void sweet_dcache_flush(vm_offset_t addr, unsigned length);     /* osfmk/arm/caches.c (0111): dc civac */
+ }
+ 
+ /* Linux's include/uapi/drm/msm_drm.h and drm.h: the requests' numbers and structures. */
+@@ -236,6 +243,7 @@ SweetGPU::start(IOService * provider)
+ 
+ struct gpu_buffer {
+ 	IOBufferMemoryDescriptor *      memory;         /* NULL: this handle is free */
++	uint8_t *                       kernel;         /* where it is in the kernel */
+ 	uint64_t                        address;        /* the GPU's for it */
+ 	uint64_t                        size;
+ 	uint32_t                        flags;
+@@ -349,8 +357,8 @@ SweetGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		return kIOReturnBadArgument;
+ 	}
+ 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+-	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+-	    kIOMapWriteCombineCache, (vm_size_t) size, PAGE_SIZE);
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++	    (vm_size_t) size, PAGE_SIZE);
+ 	if (memory == NULL) {
+ 		IOLog("SweetGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB)\n", size, fBufferCount, fBufferBytes >> 20);
+ 		return kIOReturnNoMemory;
+@@ -388,6 +396,8 @@ SweetGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	b->memory = memory;
++	b->kernel = (uint8_t *) memory->getBytesNoCopy();
++	sweet_dcache_flush((vm_offset_t) b->kernel, (unsigned) size);  /* the zeroes in memory, where the GPU reads */
+ 	b->address = address;
+ 	b->size = size;
+ 	b->flags = request->flags;
+@@ -467,7 +477,13 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+ 		addresses[count] = b->address + cmds[i].submit_offset;
+ 		words[count++] = cmds[i].size / 4;
+ 	}
+-	__builtin_arm_dsb(0xf);                         /* what the program wrote (write-combined) is in memory */
++	for (uint32_t i = 0; i < request->nr_bos; i++) {        /* what the program wrote, in memory for the GPU */
++		struct gpu_buffer * b = buffer(bos[i].handle);
++
++		if (b != NULL) {
++			sweet_dcache_flush((vm_offset_t) b->kernel, (unsigned) b->size);
++		}
++	}
+ 	request->fence = sweet_a610_submit(addresses, words, count);
+ 	if (request->fence == 0) {
+ 		sweet_a610_report("SweetGPU: the ring is full");
+@@ -569,6 +585,8 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		if (fence != 0 && !sweet_a610_done(fence) &&
+ 		    !gpuWait(fence, (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout))) {
+ 			ret = kIOReturnBusy;
++		} else if (b != NULL && b->fence != 0) {
++			sweet_dcache_flush((vm_offset_t) b->kernel, (unsigned) b->size);       /* what the GPU wrote, for the program */
+ 		}
+ 		IOLockUnlock(gGPULock);
+ 		break;
+@@ -580,6 +598,13 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		IOLockLock(gGPULock);
+ 		if (!gpuWait(r.waitFence.fence, millisecondsUntil(&r.waitFence.timeout))) {
+ 			ret = kIOReturnTimeout;
++		} else {
++			/* what the GPU wrote, for the program: the buffers whose last submission this was */
++			for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++				if (fBuffers[i].memory != NULL && fBuffers[i].fence == r.waitFence.fence) {
++					sweet_dcache_flush((vm_offset_t) fBuffers[i].kernel, (unsigned) fBuffers[i].size);
++				}
++			}
+ 		}
+ 		IOLockUnlock(gGPULock);
+ 		break;
