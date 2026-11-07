@@ -34,6 +34,7 @@ never in git or CI artifacts.
 | GPU command processor (steps 10-12) | ✅ | 0221: `sysctl kern.sweetgpu=12`: SQE microcode, ring, GPU stream to SMMU context 4 untranslated, CP_ME_INIT, CP_SET_SECURE_MODE 0 (TRUST_CNTL 1 -> 0), CP_MEM_WRITE lands in our memory |
 | GPU 2D engine to the panel (steps 13-14) | ✅ | 0222: solid fill verified in memory, then three bands drawn into the boot framebuffer (0x5c000000) |
 | GPU SMMU page tables | ✅ | 0223: boot-arg `sweetgpu_smmu=1`: context 0 with our tables (4K, 39 bits); steps 12-14 pass translated, no faults |
+| GPU kept on, submissions | ✅ | 0224: `sysctl kern.sweetgpu=15`: GPU stays on; command buffer in scattered pages submitted, fence waited (6 ms); `sweet_a610_*` interface for a service |
 | DYLD_* / inserted libraries | ✅ | 0217: the AMFI stand-in answers dyld's policy call |
 | USB networking | ✅ | 0214, boot-args `sweetusb=2 sweethw=1`; phone 192.168.7.2, live log udp/5140 |
 | SSH | ✅ | dropbear from `dropbear.yml` with `tools/dropbear/sweet_pw.c`: libinfo user lookups fail on the port, so OpenSSH rejects every user |
