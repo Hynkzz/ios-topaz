@@ -1,8 +1,22 @@
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index d563bcd..97a33ef 100644
+index d563bcd..8ffa22b 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -961,10 +961,20 @@ static IOReturn
+@@ -392,7 +392,12 @@ static void
+ sweet_surface_use_locked(SweetSurface *s, uint32_t category, int delta)
+ {
+ 	s->useCount[category] += delta;
+-	*(uint64_t *)sweet_state(s, SWEET_STATE_USECOUNT) = (uint64_t)s->useCount[1] << 32 | s->useCount[0];
++	/*
++	 * Added to, not set: SweetFramebuffer.cpp (0099) adds its own holds on a surface the panel
++	 * still shows to the same counter (category 0), so that CoreAnimation does not draw into it.
++	 */
++	OSAddAtomic64(category ? (SInt64)delta * (1LL << 32) : (SInt64)delta,
++	    (volatile SInt64 *)sweet_state(s, SWEET_STATE_USECOUNT));
+ }
+ 
+ /*
+@@ -961,10 +966,20 @@ static IOReturn
  sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
  {
  	if (args->structureOutputDescriptor != NULL) {
@@ -25,7 +39,7 @@ index d563bcd..97a33ef 100644
  		args->structureOutputDescriptorSize = len;
  		return kIOReturnSuccess;
  	}
-@@ -1021,7 +1031,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -1021,7 +1036,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  		if (copy == NULL) {
  			return kIOReturnNoMemory;
  		}
