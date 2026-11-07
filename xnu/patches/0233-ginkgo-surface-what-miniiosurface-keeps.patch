@@ -1,0 +1,629 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 7fdab22..8e31876 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -184,7 +184,9 @@ static bool gGPUCleanAll;                       /* boot-arg sweetgpu_flushall=1:
+ static uint32_t
+ surface_seed(SweetSurface * s)
+ {
+-	return s != NULL && s->state != NULL ? *(volatile uint32_t *) ((uint8_t *) s->state->getBytesNoCopy() + 0xc) : 0;
++	/* (less the moves of unlocks that say only the GPU drew: those need no cleaning; SweetSurface.cpp) */
++	return s != NULL && s->state != NULL ?
++	       *(volatile uint32_t *) ((uint8_t *) s->state->getBytesNoCopy() + 0xc) - s->gpuBumps : 0;
+ }
+ 
+ /* Wait for submission `fence`; with gGPULock held, which is let go of while waiting. */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 3714748..5f749cb 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -22,8 +22,14 @@
+  * into each task that creates or looks it up; mappings are counted per
+  * client and dropped on release or close.
+  *
+- * Values, notifications, accelerators and shared events are accepted and
+- * ignored (logged once per selector).
++ * Values (sel 9/10/11), bulk attachments (27), the YCbCr matrix (5), the
++ * accelerator binding (12), purgeability (20) and the use counts are kept as
++ * Floppikrob/willow-hackios's MiniIOSurface (iOS 16.5) keeps them, in the
++ * shared state page where the library reads them; a client lets go of a
++ * surface in two steps, trap 4 "detach" under its cache lock and trap 5
++ * "release" after it (IOSurface.framework 16.7 does the same). Notifications,
++ * ownership, timestamps and shared events are accepted and ignored (logged
++ * once per selector).
+  */
+ #include "SweetSurface.h"
+ 
+@@ -39,14 +45,23 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
++#include <libkern/c++/OSSerialize.h>
++#include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceSetYCbCrMatrix     = 5,
+ 	kSweetSurfaceWrapClientImage    = 6,
+ 	kSweetSurfaceWrapClientMemory   = 7,
++	kSweetSurfaceSetValue           = 9,
++	kSweetSurfaceCopyValue          = 10,
++	kSweetSurfaceRemoveValue        = 11,
++	kSweetSurfaceBindAccel          = 12,
+ 	kSweetSurfaceLimits             = 13,
++	kSweetSurfaceSetPurgeable       = 20,
++	kSweetSurfaceSetBulkAttachments = 27,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+ };
+@@ -56,8 +71,8 @@ enum {
+ 	kSweetSurfaceTrapDecrementUse   = 1,
+ 	kSweetSurfaceTrapLock           = 2,
+ 	kSweetSurfaceTrapUnlock         = 3,
+-	kSweetSurfaceTrapRelease        = 4,
+-	kSweetSurfaceTrapReleaseFailed  = 5,
++	kSweetSurfaceTrapDetach         = 4,    /* the client is about to release: a lookup meanwhile gets a fresh view */
++	kSweetSurfaceTrapRelease        = 5,
+ };
+ 
+ #define SWEET_SURFACE_RESULT_SIZE       0xa68
+@@ -68,7 +83,19 @@ enum {
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++/* the rest of the state page (MiniIOSurface.h's struct minisurf_shared) */
++#define SWEET_STATE_ACCEL               0x8     /* u16 accelerator, u16 sub-id */
++#define SWEET_STATE_USECOUNT            0x18    /* u64: category 1 << 32 | category 0 */
++#define SWEET_STATE_VALUES_SEED         0x20
++#define SWEET_STATE_YCBCR               0x24
++#define SWEET_STATE_VALUES_SIZE         0x28    /* room a client needs to fetch the values; 0 = none */
++#define SWEET_STATE_SIZE_CASTING        0x2c
++#define SWEET_STATE_DISPLAYABLE         0x2d
++#define SWEET_STATE_SYSMEM_ONLY         0x2e
++#define SWEET_STATE_ATTACHMENTS         0x30    /* 0x70 bytes of bulk attachments */
++#define SWEET_STATE_ATTACHMENTS_SIZE    0x70
+ #define kIOSurfaceLockReadOnly          0x1
++#define kIOSurfaceLockGPUWrote          0x40000000u     /* eagl.c's: only the GPU wrote */
+ 
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+@@ -155,6 +182,7 @@ SweetSurface::free()
+ 	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
++	OSSafeReleaseNULL(values);
+ 	sweet_scanout_free_slot(scanoutSlot);
+ 	scanoutSlot = -1;
+ 	OSObject::free();
+@@ -181,6 +209,39 @@ sweet_surface_seed(SweetSurface *s)
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
+ }
+ 
++static uint8_t *
++sweet_state(SweetSurface *s, uint32_t offset)
++{
++	return (uint8_t *)s->state->getBytesNoCopy() + offset;
++}
++
++/* The values changed: a new seed, and how much room fetching them takes. Lock held. */
++static void
++sweet_surface_values_changed(SweetSurface *s)
++{
++	uint32_t size = 0;
++	if (s->values != NULL && s->values->getCount() != 0) {
++		OSSerialize *ser = OSSerialize::binaryWithCapacity(4096);
++		if (ser != NULL) {
++			if (s->values->serialize(ser)) {
++				size = ser->getLength() + 8;
++			}
++			ser->release();
++		}
++	}
++	uint32_t *seed = (uint32_t *)sweet_state(s, SWEET_STATE_VALUES_SEED);
++	*seed = (*seed + 2) | 1;
++	*(uint32_t *)sweet_state(s, SWEET_STATE_VALUES_SIZE) = size;
++}
++
++/* Lock held. */
++static void
++sweet_surface_use_locked(SweetSurface *s, uint32_t category, int delta)
++{
++	s->useCount[category] += delta;
++	*(uint64_t *)sweet_state(s, SWEET_STATE_USECOUNT) = (uint64_t)s->useCount[1] << 32 | s->useCount[0];
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+@@ -282,6 +343,11 @@ sweet_surface_alloc(void)
+ 		return NULL;
+ 	}
+ 	bzero(s->state->getBytesNoCopy(), page_size);
++	*sweet_surface_seed(s) = 1;
++	*(uint32_t *)sweet_state(s, SWEET_STATE_VALUES_SEED) = 1;
++	*sweet_state(s, SWEET_STATE_SIZE_CASTING) = 1;
++	*sweet_state(s, SWEET_STATE_DISPLAYABLE) = 1;
++	s->values = OSDictionary::withCapacity(4);
+ 	return s;
+ }
+ 
+@@ -440,6 +506,8 @@ public:
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint32_t      use[2];   /* what this client added to the surface's use counts */
++	bool          detached; /* trap 4 came: the client is releasing it */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -453,6 +521,12 @@ SweetSurfaceRef::free()
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
++		if (use[0] != 0 || use[1] != 0) {
++			IOLockLock(sweet_surface_lock);
++			sweet_surface_use_locked(surface, 0, -(int)use[0]);
++			sweet_surface_use_locked(surface, 1, -(int)use[1]);
++			IOLockUnlock(sweet_surface_lock);
++		}
+ 		sweet_surface_put(surface);
+ 		surface->release();
+ 		surface = NULL;
+@@ -489,7 +563,10 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
+ 
+-	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
++	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index, bool detached = false);
++	SweetSurface *heldInput(IOExternalMethodArguments *args, uint32_t at, const uint8_t **in, size_t *inSize,
++	    IOMemoryMap **map);
++	IOReturn values(uint32_t selector, IOExternalMethodArguments *args);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+@@ -503,7 +580,9 @@ public:
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -511,6 +590,8 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+ 
++static SweetSurface *sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id);
++
+ static uint64_t sweet_surf_logged;      /* selectors / traps already logged (< 64) */
+ 
+ static void
+@@ -561,11 +642,11 @@ IOSurfaceRootUserClient::clientClose(void)
+ 
+ /* Lock held. */
+ SweetSurfaceRef *
+-IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
++IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index, bool detached)
+ {
+ 	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+ 		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
+-		if (ref->surface->id == id) {
++		if (ref->surface->id == id && ref->detached == detached) {
+ 			if (index != NULL) {
+ 				*index = i;
+ 			}
+@@ -645,6 +726,31 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+ 	memcpy(p + off, &v, 8);
+ }
+ 
++/*
++ * Components of a plane of 8-bit BGRA or RGBA, in memory order (names: 1 alpha, 2 red, 3 green,
++ * 4 blue; type 1 unsigned integer, range 1 full), as MiniIOSurface describes them. With none,
++ * IOSurfaceGetNumberOfComponentsOfPlane() said 0 of every surface.
++ */
++static void
++sweet_plane_components(uint8_t *p, uint32_t format)
++{
++	static const uint8_t bgra[4] = { 4, 3, 2, 1 };
++	static const uint8_t rgba[4] = { 2, 3, 4, 1 };
++	const uint8_t *names = format == 'BGRA' ? bgra : format == 'RGBA' ? rgba : NULL;
++
++	if (names == NULL) {
++		return;
++	}
++	p[0x1c] = 4;
++	for (int i = 0; i < 4; i++) {
++		p[0x20 + i] = 8;                /* bit depth */
++		p[0x24 + i] = (uint8_t)(8 * i); /* bit offset */
++		p[0x28 + i] = names[i];
++		p[0x2c + i] = 1;
++		p[0x30 + i] = 1;
++	}
++}
++
+ /* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
+ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+@@ -668,12 +774,28 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	put32(out, 0x44, s->cacheMode);
+ 	put32(out, 0x50, s->parentID);
+ 	put32(out, 0x54, 1);
++	if (s->planeCount == 0) {
++		/*
++		 * The one implicit plane, for the per-plane getters: with planeCount 0 the library
++		 * reads plane 0's components here (IOSurfaceClientGetNumberOfComponentsOfPlane).
++		 */
++		uint8_t *p = out + 0x68;
++		put32(p, 0x00, s->width);
++		put32(p, 0x04, s->height);
++		put32(p, 0x10, s->bytesPerRow);
++		put32(p, 0x14, s->bytesPerRow * sweet_div_up(s->height, s->elementHeight ? s->elementHeight : 1));
++		memcpy(p + 0x18, &s->bytesPerElement, 2);
++		p[0x1a] = s->elementWidth;
++		p[0x1b] = s->elementHeight;
++		sweet_plane_components(p, s->pixelFormat);
++	}
+ 	for (uint32_t i = 0; i < s->planeCount; i++) {
+ 		uint8_t *p = out + 0x68 + i * 0x80;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
++		/* (+0x10: IOSurfaceClientGetBytesPerRowOfPlane reads it there; +0x08 is not it) */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+@@ -767,6 +889,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
++	*sweet_state(s, SWEET_STATE_SIZE_CASTING) = (uint8_t)sweet_dict_u32(props, "IOSurfacePixelSizeCastingAllowed", 1);
++	*sweet_state(s, SWEET_STATE_SYSMEM_ONLY) = (uint8_t)sweet_dict_u32(props, "IOSurfaceSysMemOnly", 0);
+ 	OSNumber *client = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
+ 	if (ret == kIOReturnSuccess && client != NULL) {
+ 		/*
+@@ -875,6 +999,157 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++/*
++ * The surface a values request names (its first 4 of 8 bytes; bulk attachments: at +0x80), held,
++ * with the request mapped when it came as a descriptor; NULL when this client does not have it.
++ */
++SweetSurface *
++IOSurfaceRootUserClient::heldInput(IOExternalMethodArguments *args, uint32_t at, const uint8_t **in, size_t *inSize,
++    IOMemoryMap **map)
++{
++	uint32_t id;
++
++	*map = NULL;
++	*in = (const uint8_t *)args->structureInput;
++	*inSize = args->structureInputSize;
++	if (args->structureInputDescriptor != NULL) {
++		*map = args->structureInputDescriptor->map(kIOMapReadOnly);
++		if (*map == NULL) {
++			return NULL;
++		}
++		*in = (const uint8_t *)(*map)->getVirtualAddress();
++		*inSize = (size_t)(*map)->getLength();
++	}
++	if (*in == NULL || *inSize < (size_t)at + 9 || *inSize > SWEET_SURFACE_MAX_PROPS) {
++		return NULL;
++	}
++	memcpy(&id, *in + at, sizeof(id));
++	return sweet_surface_held(fLock, fRefs, id);
++}
++
++static IOReturn
++sweet_seed_out(IOExternalMethodArguments *args, uint32_t seed)
++{
++	if (args->structureOutput != NULL && args->structureOutputSize >= sizeof(seed)) {
++		memcpy(args->structureOutput, &seed, sizeof(seed));
++		args->structureOutputSize = sizeof(seed);
++	}
++	return kIOReturnSuccess;
++}
++
++/*
++ * IOSurfaceSetValue & co. Requests: the surface in 8 bytes, then a serialized [value, key] or [all]
++ * (set) or a key, empty for all (copy, remove). Replies to changes: the new values seed; to copy:
++ * 4 unused bytes, the seed, the serialized value. Bulk attachments (colour space, transfer function):
++ * 0x70 bytes, their size, a mask of the fields to take, the surface; kept in the state page.
++ */
++IOReturn
++IOSurfaceRootUserClient::values(uint32_t selector, IOExternalMethodArguments *args)
++{
++	static const struct {
++		uint8_t from, to;
++	} fields[15] = {
++		{ 0x00, 0x20 }, { 0x20, 0x30 }, { 0x30, 0x38 }, { 0x38, 0x39 }, { 0x39, 0x3a }, { 0x3a, 0x3b }, { 0x3b, 0x3c },
++		{ 0x3c, 0x3d }, { 0x3d, 0x3e }, { 0x3e, 0x3f }, { 0x3f, 0x40 }, { 0x40, 0x58 }, { 0x58, 0x5c }, { 0x5c, 0x64 },
++		{ 0x64, 0x65 },
++	};
++	const uint8_t *in;
++	size_t inSize;
++	IOMemoryMap *map;
++	OSSerialize *ser = NULL;
++	OSObject *obj = NULL;
++	uint32_t seed = 0, header[2] = { 0, 0 }, length = 0;
++	IOReturn ret = kIOReturnSuccess;
++
++	/* (bulk attachments: the attachments, their size, a mask, then the surface at +0x80) */
++	SweetSurface *s = heldInput(args, selector == kSweetSurfaceSetBulkAttachments ? 0x80 : 0, &in, &inSize, &map);
++	if (s == NULL) {
++		OSSafeReleaseNULL(map);
++		return kIOReturnNotFound;
++	}
++	if (selector == kSweetSurfaceSetValue) {
++		obj = OSUnserializeXML((const char *)in + 8, inSize - 8);      /* (binary or XML) */
++	}
++	IOLockLock(sweet_surface_lock);
++	if (s->values == NULL) {
++		ret = kIOReturnNoMemory;
++	} else if (selector == kSweetSurfaceSetBulkAttachments) {
++		uint64_t size, mask;
++		memcpy(&size, in + 0x70, sizeof(size));
++		memcpy(&mask, in + 0x78, sizeof(mask));
++		if (size > SWEET_STATE_ATTACHMENTS_SIZE) {
++			ret = kIOReturnBadArgument;
++		} else {
++			for (unsigned int i = 0; i < 15; i++) {
++				if ((mask & (1ULL << i)) && fields[i].to <= size) {
++					memcpy(sweet_state(s, SWEET_STATE_ATTACHMENTS + fields[i].from), in + fields[i].from,
++					    fields[i].to - fields[i].from);
++				}
++			}
++		}
++	} else if (selector == kSweetSurfaceSetValue) {
++		OSArray *array = OSDynamicCast(OSArray, obj);
++		OSString *key = array != NULL ? OSDynamicCast(OSString, array->getObject(1)) : NULL;
++		OSDictionary *all = array != NULL ? OSDynamicCast(OSDictionary, array->getObject(0)) : NULL;
++		if (array != NULL && array->getCount() == 2 && key != NULL) {
++			s->values->setObject(key, array->getObject(0));
++		} else if (array != NULL && array->getCount() == 1 && all != NULL) {
++			s->values->merge(all);
++		} else {
++			ret = kIOReturnBadArgument;
++		}
++	} else if (in[inSize - 1] != 0) {
++		ret = kIOReturnBadArgument;
++	} else if (selector == kSweetSurfaceRemoveValue) {
++		if (in[8] == 0) {
++			s->values->flushCollection();
++		} else {
++			s->values->removeObject((const char *)in + 8);
++		}
++	} else {
++		OSObject *value = in[8] ? s->values->getObject((const char *)in + 8) : s->values;
++		header[1] = *(uint32_t *)sweet_state(s, SWEET_STATE_VALUES_SEED);
++		if (value != NULL && (in[8] != 0 || s->values->getCount() != 0)) {
++			ser = OSSerialize::binaryWithCapacity(4096);
++			if (ser == NULL || !value->serialize(ser)) {
++				ret = kIOReturnNoMemory;
++			} else {
++				length = ser->getLength();
++			}
++		}
++	}
++	if (ret == kIOReturnSuccess && (selector == kSweetSurfaceSetValue || selector == kSweetSurfaceRemoveValue)) {
++		sweet_surface_values_changed(s);
++		seed = *(uint32_t *)sweet_state(s, SWEET_STATE_VALUES_SEED);
++	}
++	IOLockUnlock(sweet_surface_lock);
++	OSSafeReleaseNULL(obj);
++	OSSafeReleaseNULL(map);
++	s->release();
++
++	if (ret != kIOReturnSuccess || selector == kSweetSurfaceSetBulkAttachments) {
++		OSSafeReleaseNULL(ser);
++		return ret;
++	}
++	if (selector != kSweetSurfaceCopyValue) {
++		return sweet_seed_out(args, seed);
++	}
++	uint32_t total = (uint32_t)sizeof(header) + length;
++	uint8_t *reply = (uint8_t *)IOMallocData(total);
++	if (reply == NULL) {
++		ret = kIOReturnNoMemory;
++	} else {
++		memcpy(reply, header, sizeof(header));
++		if (length != 0) {
++			memcpy(reply + sizeof(header), ser->text(), length);
++		}
++		ret = sweet_struct_out(args, reply, total);
++		IOFreeData(reply, total);
++	}
++	OSSafeReleaseNULL(ser);
++	return ret;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -926,6 +1201,43 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case kSweetSurfaceSetValue:
++	case kSweetSurfaceCopyValue:
++	case kSweetSurfaceRemoveValue:
++	case kSweetSurfaceSetBulkAttachments:
++		sweet_surf_log_once("sel", selector);
++		return values(selector, args);
++	case kSweetSurfaceSetYCbCrMatrix:       /* in: surface, matrix */
++	case kSweetSurfaceBindAccel:            /* in: surface, accelerator, sub-id */
++	case kSweetSurfaceSetPurgeable: {       /* in: surface, new state (3: keep); out: old state */
++		uint32_t need = selector == kSweetSurfaceBindAccel ? 3 : 2;
++		sweet_surf_log_once("sel", selector);
++		if (args->scalarInputCount < need) {
++			return kIOReturnBadArgument;
++		}
++		SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)arg0);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		IOLockLock(sweet_surface_lock);
++		if (selector == kSweetSurfaceSetYCbCrMatrix) {
++			*(uint32_t *)sweet_state(s, SWEET_STATE_YCBCR) = (uint32_t)args->scalarInput[1];
++		} else if (selector == kSweetSurfaceBindAccel) {
++			uint16_t accel[2] = { (uint16_t)args->scalarInput[1], (uint16_t)args->scalarInput[2] };
++			memcpy(sweet_state(s, SWEET_STATE_ACCEL), accel, sizeof(accel));
++		} else {
++			if (args->scalarOutputCount >= 1) {
++				args->scalarOutput[0] = s->purgeable;
++				args->scalarOutputCount = 1;
++			}
++			if (args->scalarInput[1] != 3) {
++				s->purgeable = (uint32_t)args->scalarInput[1];
++			}
++		}
++		IOLockUnlock(sweet_surface_lock);
++		s->release();
++		return kIOReturnSuccess;
++	}
+ 	case kSweetSurfaceWrapClientImage:
+ 	case kSweetSurfaceWrapClientMemory:
+ 		/*
+@@ -950,11 +1262,41 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ }
+ 
++static IOReturn
++sweet_surface_use_count(IOLock *lock, OSArray *refs, uint32_t id, uintptr_t category, int delta)
++{
++	IOReturn ret = kIOReturnNotFound;
++	if (category > 1) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(lock);
++	for (unsigned int i = 0; i < refs->getCount(); i++) {
++		SweetSurfaceRef *ref = (SweetSurfaceRef *)refs->getObject(i);
++		if (ref->surface->id == id && !ref->detached) {
++			if (delta > 0 || ref->use[category] != 0) {
++				ref->use[category] += delta;
++				IOLockLock(sweet_surface_lock);
++				sweet_surface_use_locked(ref->surface, (uint32_t)category, delta);
++				IOLockUnlock(sweet_surface_lock);
++			}
++			ret = kIOReturnSuccess;
++			break;
++		}
++	}
++	IOLockUnlock(lock);
++	return ret;
++}
++
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
++IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
+ {
+-	return kIOReturnSuccess;
++	return sweet_surface_use_count(fLock, fRefs, (uint32_t)(uintptr_t)id, (uintptr_t)category, 1);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return sweet_surface_use_count(fLock, fRefs, (uint32_t)(uintptr_t)id, (uintptr_t)category, -1);
+ }
+ 
+ static IOReturn
+@@ -1007,19 +1349,44 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+-	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+-	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	bool write = !((uintptr_t)options & kIOSurfaceLockReadOnly);
++	if (write && ((uintptr_t)options & kIOSurfaceLockGPUWrote)) {
++		/* readers see a new seed; the GPU's submissions need not clean it out of the caches (SweetGPU.cpp) */
++		OSIncrementAtomic((volatile SInt32 *)&s->gpuBumps);
++	}
++	IOReturn ret = sweet_surface_seed_out(s, seedOut, write);
+ 	s->release();
+ 	return ret;
+ }
+ 
++/*
++ * IOSurface.framework drops a surface in two steps: trap 4 while it holds its cache lock, trap 5
++ * after letting go of it. Both were "release" here; a lookup of the same surface between the two
++ * (another thread, the cache already without it) mapped it afresh, and trap 5 then unmapped that
++ * new view under its new client.
++ */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
++{
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL, false);
++	if (ref != NULL) {
++		ref->detached = true;
++	}
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+ {
+ 	unsigned int index;
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
+-	if (ref != NULL && --ref->count == 0) {
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index, true);
++	if (ref == NULL) {
++		ref = findRef((uint32_t)(uintptr_t)id, &index, false);
++	}
++	if (ref != NULL && (ref->detached || --ref->count == 0)) {
+ 		fRefs->removeObject(index);     /* unmaps and drops the user count */
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -1027,12 +1394,12 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
++	[kSweetSurfaceTrapDetach]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
+ IOExternalTrap *
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 4c1e27b..b01fed2 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -14,6 +14,7 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSObject.h>
++#include <libkern/c++/OSDictionary.h>
+ #include <mach/mach_types.h>
+ 
+ #define SWEET_SURFACE_MAX_PLANES        20
+@@ -42,8 +43,13 @@ public:
+ 	uint64_t                  scanoutPhys;  /* topaz: physically contiguous scanout slot, or 0 */
+ 	int                       scanoutSlot;  /* pool slot, -1 when not from the pool */
+ 	bool                      wrapped;      /* memory is the creator's own (IOSurfaceAddress), held prepared */
++	OSDictionary             *values;       /* IOSurfaceSetValue's, sweet_surface_lock */
++	uint32_t                  useCount[2];  /* per category, mirrored in the state page; sweet_surface_lock */
++	uint32_t                  purgeable;
++	volatile uint32_t         gpuBumps;     /* seed moves by unlocks of kIOSurfaceLockGPUWrote: the GPU drew, no processor */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; wrapped = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; wrapped = false; values = NULL;
++		purgeable = 0; gpuBumps = 0; useCount[0] = useCount[1] = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

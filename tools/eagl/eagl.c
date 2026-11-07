@@ -874,6 +874,27 @@ surface_to_texture(struct eagl *e, struct image *image)
 	if (image->shared) {
 		return;
 	}
+	if (row * (size_t)image->height >= 1024 * 1024) {
+		/* ginkgo: which big surface is filled again and again, and why (the first 8 times of each of 8) */
+		static uint32_t big_ids[8], big_times[8];
+		uint32_t id = IOSurfaceGetID(surface);
+		unsigned i = 0;
+
+		while (i < 8 && big_ids[i] != 0 && big_ids[i] != id) {
+			i++;
+		}
+		if (i < 8 && big_times[i] < 8) {
+			big_ids[i] = id;
+			big_times[i]++;
+			say("redwood-gl: frame %u: texture %u filled again from surface %u ('%.4s' %zu x %zu, %zu bytes): target %d, "
+			    "wrapped %d, painted %d, mirror %u, alpha first %d, invert %d, seed %u (was %u), use count %d\n",
+			    e->frames + 1, image->texture, id,
+			    (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) }, IOSurfaceGetWidth(surface),
+			    IOSurfaceGetHeight(surface), row * (size_t)image->height, image->target, image->wrapped, image->painted,
+			    image->mirror, image->alpha_first, image->invert, IOSurfaceGetSeed(surface), image->seed,
+			    (int)IOSurfaceGetUseCount(surface));
+		}
+	}
 	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
 		say("redwood-gl: an IOSurface cannot be locked\n");
 		return;
