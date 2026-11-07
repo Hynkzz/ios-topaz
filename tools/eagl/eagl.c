@@ -4414,6 +4414,25 @@ install(void)
 		say("redwood-gl: this program has no EAGLContext: nothing to do\n");
 		return;
 	}
+	/*
+	 * ginkgo: inserted into backboardd by launchd.plist for good, so it does nothing unless the
+	 * boot asks (boot-arg sweetgl=1; eagl_test sets SWEETGL=1 instead). The window server starts
+	 * before the GPU is kept on (sweetgpu=2 waits 20 s): Mesa would find no GPU and draw with
+	 * softpipe, so the GPU is waited for here, up to 45 s (kern.sweetgpu reads 15 once it is on).
+	 */
+	if (strstr(arguments, "sweetgl=1") == NULL && getenv("SWEETGL") == NULL) {
+		return;
+	}
+	for (int waited = 0; waited < 45 * 4; waited++) {
+		int step = 0;
+		size_t length = sizeof(step);
+
+		if (sysctlbyname("kern.sweetgpu", &step, &length, NULL, 0) == 0 && step == 15) {
+			say("redwood-gl: the GPU is on (after %d ms)\n", waited * 250);
+			break;
+		}
+		usleep(250000);
+	}
 	for (unsigned i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
 		SEL selector = sel_registerName(methods[i].name);
 		Method method = class_getInstanceMethod(class, selector);

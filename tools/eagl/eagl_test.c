@@ -5,8 +5,9 @@
  * with iOS's OpenGLES.framework, then glClearColor/glClear/glReadPixels called as iOS's functions,
  * which jump through the context's table (eagl.c, struct eagl). Run with
  *
- *   DYLD_INSERT_LIBRARIES=/var/sweet/lib/libsweet-gl.dylib /var/root/eagl_test
+ *   SWEETGL=1 DYLD_INSERT_LIBRARIES=/var/sweet/lib/libsweet-gl.dylib /var/root/eagl_test
  *
+ * (SWEETGL=1 stands in for the boot-arg sweetgl=1 the library otherwise waits for.)
  * Without the library iOS's EAGLContext has no accelerator here and gives no context.
  */
 #include <objc/message.h>
